@@ -1,0 +1,107 @@
+# TradingView Webhook Server Configuration
+# stocks_plugin - tradingview/webhooks/config.yaml
+
+server:
+  host: "0.0.0.0"
+  port: 5000
+  debug: false
+  workers: 4
+  title: "TradingView Webhook Server"
+  version: "1.0.0"
+
+security:
+  hmac_secret: "CHANGE_ME_TO_A_SECURE_SECRET_KEY"
+  hmac_algorithm: "sha256"
+  allowed_ips:
+    - "52.89.214.238"    # TradingView webhook IP
+    - "34.212.75.30"     # TradingView webhook IP
+    - "54.218.53.128"    # TradingView webhook IP
+    - "52.32.178.7"      # TradingView webhook IP
+    - "127.0.0.1"        # Localhost
+    - "::1"              # Localhost IPv6
+  require_passphrase: true
+  passphrase: "CHANGE_ME_WEBHOOK_PASSPHRASE"
+
+rate_limiting:
+  enabled: true
+  max_requests_per_minute: 60
+  window_seconds: 60
+  burst_limit: 10
+
+broker_routing:
+  default_broker: "interactive_brokers"
+  routes:
+    - pattern: "^(AAPL|MSFT|GOOG|AMZN|META|TSLA|NVDA)$"
+      broker: "interactive_brokers"
+      description: "Major tech stocks via IB"
+    - pattern: "^(SPY|QQQ|IWM|DIA)$"
+      broker: "interactive_brokers"
+      description: "Major ETFs via IB"
+    - pattern: "^[A-Z]{1,5}$"
+      broker: "interactive_brokers"
+      description: "All US equities via IB"
+    - pattern: ".*"
+      broker: "tradestation"
+      description: "Fallback to TradeStation"
+
+alert_templates:
+  buy:
+    action: "buy"
+    order_type: "market"
+    time_in_force: "day"
+    payload:
+      symbol: "{{ticker}}"
+      action: "buy"
+      price: "{{close}}"
+      quantity: "{{strategy.order.contracts}}"
+      order_type: "market"
+      timestamp: "{{timenow}}"
+
+  sell:
+    action: "sell"
+    order_type: "market"
+    time_in_force: "day"
+    payload:
+      symbol: "{{ticker}}"
+      action: "sell"
+      price: "{{close}}"
+      quantity: "{{strategy.order.contracts}}"
+      order_type: "market"
+      timestamp: "{{timenow}}"
+
+  stop_loss:
+    action: "sell"
+    order_type: "stop"
+    time_in_force: "gtc"
+    payload:
+      symbol: "{{ticker}}"
+      action: "sell"
+      price: "{{strategy.order.price}}"
+      quantity: "{{strategy.order.contracts}}"
+      order_type: "stop"
+      timestamp: "{{timenow}}"
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/webhook_server.log"
+  max_bytes: 10485760  # 10 MB
+  backup_count: 5
+  console: true
+
+notifications:
+  enabled: true
+  channels:
+    - type: "log"
+      level: "INFO"
+    - type: "email"
+      enabled: false
+      smtp_host: "smtp.gmail.com"
+      smtp_port: 587
+      from_address: "alerts@example.com"
+      to_addresses:
+        - "trader@example.com"
+    - type: "slack"
+      enabled: false
+      webhook_url: "https://hooks.slack.com/services/CHANGE_ME"
+      channel: "#trading-alerts"

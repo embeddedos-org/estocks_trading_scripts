@@ -1,0 +1,201 @@
+"""
+Trend Following Strategy
+==========================
+
+EMA crossover with ADX trend filter and ATR trailing stop.
+
+Beginner → Intermediate example demonstrating:
+- Dual EMA crossover for trend direction
+- 200 EMA as regime filter (only long above, only short below)
+- ADX filter to avoid choppy markets
+- ATR-based position sizing and trailing stop
+
+Usage:
+    from strategies.examples.trend_following import TrendFollowingStrategy
+    strategy = TrendFollowingStrategy()
+    # Use with BacktestEngineV2
+    engine = BacktestEngineV2()
+    engine.load_data(df)
+    result = engine.run(strategy.generate_signals)
+"""
+
+from __future__ import annotations
+
+import sys
+import os
+from dataclasses import dataclass
+from typing import Any, Dict
+
+import numpy as np
+import pandas as pd
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from shared.backtesting.backtest_engine_v2 import (
+    BacktestContext,
+    BacktestEngineV2,
+    BacktestResultV2,
+)
+from shared.indicators.technical_indicators import TechnicalIndicators as TI
+from strategies import register_strategy
+
+
+@dataclass
+class TrendFollowingConfig:
+    """Configuration for TrendFollowingStrategy."""
+
+    fast_ma_length: int = 9
+    slow_ma_length: int = 21
+    trend_filter_length: int = 200
+    use_adx_filter: bool = True
+    adx_threshold: int = 25
+    stop_loss_atr_mult: float = 2.0
+    trailing_stop: bool = True
+
+
+@register_strategy("trend_following")
+class TrendFollowingStrategy:
+    """EMA crossover with ADX filter and ATR trailing stop.
+
+    Entry: fast EMA > slow EMA AND price > 200 EMA AND ADX > 25
+    Exit: fast EMA < slow EMA OR trailing stop hit
+    """
+
+    def __init__(self, config: TrendFollowingConfig | None = None) -> None:
+        self.config = config or TrendFollowingConfig()
+        self._trailing_stops: Dict[str, float] = {}
+
+    @classmethod
+    def from_params(cls, params: Dict[str, Any]) -> "TrendFollowingStrategy":
+        """Create strategy from a flat params dict (for optimizer)."""
+        config = TrendFollowingConfig(**{
+            k: v for k, v in params.items() if hasattr(TrendFollowingConfig, k)
+        })
+        return cls(config)
+
+    def generate_signals(self, ctx: BacktestContext) -> Dict[str, int]:
+        """Generate trading signals for each symbol."""
+        cfg = self.config
+        signals: Dict[str, int] = {}
+
+        for sym, df in ctx.bars.items():
+            if len(df) < cfg.trend_filter_length:
+                signals[sym] = 0
+                continue
+
+            close = df["close"]
+
+            fast_ema = TI.ema(close, cfg.fast_ma_length)
+            slow_ema = TI.ema(close, cfg.slow_ma_length)
+            trend_ema = TI.ema(close, cfg.trend_filter_length)
+
+            current_close = float(close.iloc[-1])
+            fast_val = float(fast_ema.iloc[-1])
+            slow_val = float(slow_ema.iloc[-1])
+            trend_val = float(trend_ema.iloc[-1])
+
+            adx_ok = True
+            if cfg.use_adx_filter:
+                adx_val, _, _ = TI.adx(df, 14)
+                adx_ok = float(adx_val.iloc[-1]) > cfg.adx_threshold if not np.isnan(adx_val.iloc[-1]) else False
+
+            atr = TI.atr(df, 14)
+            current_atr = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else current_close * 0.02
+
+            current_pos = ctx.positions.get(sym, 0)
+
+            # Trailing stop logic
+            if cfg.trailing_stop and current_pos != 0:
+                if current_pos > 0:
+                    new_stop = current_close - cfg.stop_loss_atr_mult * current_atr
+                    self._trailing_stops[sym] = max(
+                        self._trailing_stops.get(sym, 0), new_stop
+                    )
+                    if current_close < self._trailing_stops[sym]:
+                        signals[sym] = 0
+                        self._trailing_stops.pop(sym, None)
+                        continue
+                elif current_pos < 0:
+                    new_stop = current_close + cfg.stop_loss_atr_mult * current_atr
+                    self._trailing_stops[sym] = min(
+                        self._trailing_stops.get(sym, float("inf")), new_stop
+                    )
+                    if current_close > self._trailing_stops[sym]:
+                        signals[sym] = 0
+                        self._trailing_stops.pop(sym, None)
+                        continue
+
+            # Entry / continuation logic
+            if fast_val > slow_val and current_close > trend_val and adx_ok:
+                signals[sym] = 1
+                if current_pos <= 0:
+                    self._trailing_stops[sym] = current_close - cfg.stop_loss_atr_mult * current_atr
+            elif fast_val < slow_val and current_close < trend_val and adx_ok:
+                signals[sym] = -1
+                if current_pos >= 0:
+                    self._trailing_stops[sym] = current_close + cfg.stop_loss_atr_mult * current_atr
+            elif fast_val < slow_val and current_pos > 0:
+                signals[sym] = 0
+                self._trailing_stops.pop(sym, None)
+            elif fast_val > slow_val and current_pos < 0:
+                signals[sym] = 0
+                self._trailing_stops.pop(sym, None)
+            else:
+                signals[sym] = 1 if current_pos > 0 else (-1 if current_pos < 0 else 0)
+
+        return signals
+
+
+def _generate_trending_data(n_bars: int = 500, seed: int = 42) -> pd.DataFrame:
+    """Generate synthetic trending OHLCV data."""
+    rng = np.random.RandomState(seed)
+    dates = pd.bdate_range("2020-01-01", periods=n_bars)
+    price = 100.0
+    prices = []
+    for _ in range(n_bars):
+        ret = 0.0005 + rng.randn() * 0.015  # slight upward drift
+        price *= 1 + ret
+        high = price * (1 + abs(rng.randn()) * 0.005)
+        low = price * (1 - abs(rng.randn()) * 0.005)
+        op = price * (1 + rng.randn() * 0.002)
+        prices.append({
+            "date": dates[len(prices)],
+            "open": op,
+            "high": high,
+            "low": low,
+            "close": price,
+            "volume": int(rng.uniform(500_000, 2_000_000)),
+        })
+    return pd.DataFrame(prices)
+
+
+def run_example() -> BacktestResultV2:
+    """Run trend following strategy on synthetic data."""
+    print("=" * 60)
+    print("TREND FOLLOWING STRATEGY EXAMPLE")
+    print("=" * 60)
+
+    df = _generate_trending_data()
+    strategy = TrendFollowingStrategy()
+
+    engine = BacktestEngineV2(initial_capital=100_000)
+    engine.load_data(df)
+    result = engine.run(strategy.generate_signals)
+
+    print(f"\nTotal Return:   {result.total_return:>10.2%}")
+    print(f"Sharpe Ratio:   {result.sharpe_ratio:>10.4f}")
+    print(f"Sortino Ratio:  {result.sortino_ratio:>10.4f}")
+    print(f"Max Drawdown:   {result.max_drawdown:>10.2%}")
+    print(f"Win Rate:       {result.win_rate:>10.2%}")
+    print(f"Profit Factor:  {result.profit_factor:>10.4f}")
+    print(f"Total Trades:   {result.total_trades:>10d}")
+    print(f"CAGR:           {result.cagr:>10.2%}")
+    print(f"Calmar Ratio:   {result.calmar_ratio:>10.4f}")
+    print(f"Expectancy:     ${result.expectancy:>9.2f}")
+    print(f"Avg Duration:   {result.avg_trade_duration:>10.1f} bars")
+    print("=" * 60)
+    return result
+
+
+if __name__ == "__main__":
+    run_example()

@@ -1,0 +1,91 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © stocks_plugin
+
+//@version=5
+strategy("Momentum Breakout Strategy", overlay=true, default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10, initial_capital=100000, commission_type=strategy.commission.percent,
+         commission_value=0.1, slippage=1)
+
+// ─── Input Parameters ───
+i_dcLength      = input.int(20, "Donchian Channel Length", minval=1)
+i_atrLength     = input.int(14, "ATR Length", minval=1)
+i_atrMult       = input.float(2.0, "ATR Trailing Stop Multiplier", minval=0.1, step=0.1)
+i_volSmaLen     = input.int(20, "Volume SMA Length", minval=1)
+i_volMult       = input.float(1.5, "Volume Confirmation Multiplier", minval=1.0, step=0.1)
+i_posSize       = input.float(10.0, "Position Size (% of Equity)", minval=1.0, maxval=100.0, step=1.0)
+i_useShorts     = input.bool(true, "Allow Short Entries")
+
+// ─── Donchian Channel ───
+dcUpper = ta.highest(high, i_dcLength)
+dcLower = ta.lowest(low, i_dcLength)
+dcMid   = math.avg(dcUpper, dcLower)
+
+// ─── Volume Confirmation ───
+volSma          = ta.sma(volume, i_volSmaLen)
+volumeConfirmed = volume > volSma * i_volMult
+
+// ─── ATR Trailing Stop ───
+atrValue = ta.atr(i_atrLength)
+
+var float trailStopLong  = na
+var float trailStopShort = na
+
+if strategy.position_size > 0
+    newStop = close - atrValue * i_atrMult
+    trailStopLong := math.max(nz(trailStopLong[1], newStop), newStop)
+else
+    trailStopLong := na
+
+if strategy.position_size < 0
+    newStop = close + atrValue * i_atrMult
+    trailStopShort := math.min(nz(trailStopShort[1], newStop), newStop)
+else
+    trailStopShort := na
+
+// ─── Entry Conditions ───
+longCondition  = close > dcUpper[1] and volumeConfirmed
+shortCondition = close < dcLower[1] and volumeConfirmed and i_useShorts
+
+// ─── Position Sizing ───
+qty = math.floor((strategy.equity * i_posSize / 100.0) / close)
+
+// ─── Strategy Execution ───
+if longCondition and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Close Short → Long")
+    strategy.entry("Long", strategy.long, qty=qty, comment="Long Breakout")
+    trailStopLong := close - atrValue * i_atrMult
+
+if shortCondition and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Close Long → Short")
+    strategy.entry("Short", strategy.short, qty=qty, comment="Short Breakout")
+    trailStopShort := close + atrValue * i_atrMult
+
+// ─── Trailing Stop Exits ───
+if strategy.position_size > 0 and not na(trailStopLong)
+    strategy.exit("Long Trail Exit", "Long", stop=trailStopLong, comment="Trail Stop Long")
+
+if strategy.position_size < 0 and not na(trailStopShort)
+    strategy.exit("Short Trail Exit", "Short", stop=trailStopShort, comment="Trail Stop Short")
+
+// ─── Plots ───
+pUpper = plot(dcUpper, "DC Upper", color=color.new(color.teal, 0), linewidth=2)
+pLower = plot(dcLower, "DC Lower", color=color.new(color.orange, 0), linewidth=2)
+pMid   = plot(dcMid, "DC Mid", color=color.new(color.gray, 50), linewidth=1, style=plot.style_cross)
+fill(pUpper, pLower, color=color.new(color.blue, 90), title="DC Fill")
+
+plot(trailStopLong, "Trail Stop Long", color=color.new(color.green, 0), style=plot.style_linebr, linewidth=2)
+plot(trailStopShort, "Trail Stop Short", color=color.new(color.red, 0), style=plot.style_linebr, linewidth=2)
+
+// ─── Volume Confirmation Visual ───
+barcolor(volumeConfirmed ? (close > open ? color.lime : color.fuchsia) : na, title="Volume Confirmed Bar")
+
+// ─── Background Color for Position Direction ───
+bgColor = strategy.position_size > 0 ? color.new(color.green, 90) :
+          strategy.position_size < 0 ? color.new(color.red, 90) : na
+bgcolor(bgColor, title="Position Background")
+
+// ─── Alerts ───
+alertcondition(longCondition, title="Long Breakout", message="Momentum Breakout: Long entry signal on {{ticker}}")
+alertcondition(shortCondition, title="Short Breakout", message="Momentum Breakout: Short entry signal on {{ticker}}")

@@ -1,0 +1,167 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © stocks_plugin
+
+//@version=5
+strategy("Opening Range Breakout (ORB)", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         initial_capital=100000, commission_type=strategy.commission.percent,
+         commission_value=0.1, slippage=1)
+
+// ─── Inputs ───
+i_orbMinutes    = input.int(30, "ORB Period (minutes)", options=[15, 30, 60], group="ORB Settings", tooltip="Minutes after market open to define the opening range. 30 min is most common.")
+i_target1Mult   = input.float(1.5, "Target 1 (x Range)", minval=0.5, step=0.5, group="Targets", tooltip="First profit target = ORB range × this multiplier.")
+i_target2Mult   = input.float(2.0, "Target 2 (x Range)", minval=1.0, step=0.5, group="Targets", tooltip="Second profit target = ORB range × this multiplier.")
+i_splitTargets  = input.bool(true, "Split Position at Targets", group="Targets", tooltip="Split position: exit half at Target 1, remainder at Target 2.")
+i_volConfirm    = input.bool(true, "Volume Confirmation", group="Filters", tooltip="Require above-average volume on the breakout bar.")
+i_volSmaLen     = input.int(20, "Volume SMA Length", minval=1, group="Filters", tooltip="Lookback for average volume calculation.")
+i_volMult       = input.float(1.2, "Volume Multiplier", minval=1.0, step=0.1, group="Filters", tooltip="Volume must exceed SMA × this for breakout confirmation.")
+i_posSize       = input.float(10.0, "Position Size %", minval=1.0, maxval=100.0, group="Risk", tooltip="Percentage of equity per trade.")
+i_useShorts     = input.bool(true, "Allow Short Entries", group="Risk", tooltip="Enable short entries on ORB breakdown below the opening range low.")
+i_exitBeforeClose = input.bool(true, "Exit Before Market Close", group="Risk", tooltip="Auto-close all positions before market close. Prevents overnight risk.")
+i_exitMinBefore = input.int(15, "Minutes Before Close to Exit", minval=5, group="Risk", tooltip="Close positions this many minutes before 4:00 PM ET.")
+i_showDash      = input.bool(true, "Show Dashboard", group="Display", tooltip="Show ORB high, low, range, and position status.")
+
+// ─── Session Settings (9:30 - 16:00 ET) ───
+i_sessionStart  = input.session("0930-1600", "Trading Session (ET)", group="Session")
+
+// ─── Time Calculations ───
+isInSession = not na(time(timeframe.period, i_sessionStart, "America/New_York"))
+marketOpenTime = timestamp("America/New_York", year, month, dayofmonth, 9, 30, 0)
+orbEndTime = marketOpenTime + i_orbMinutes * 60 * 1000
+marketCloseTime = timestamp("America/New_York", year, month, dayofmonth, 16, 0, 0)
+exitTime = marketCloseTime - i_exitMinBefore * 60 * 1000
+
+isORBPeriod = time >= marketOpenTime and time < orbEndTime
+isAfterORB  = time >= orbEndTime and isInSession
+isExitTime  = time >= exitTime and isInSession
+
+// ─── Opening Range Tracking ───
+var float orbHigh = na
+var float orbLow  = na
+var bool  orbSet  = false
+var bool  tradedToday = false
+
+isNewDay = ta.change(time("D")) != 0
+
+if isNewDay
+    orbHigh := na
+    orbLow := na
+    orbSet := false
+    tradedToday := false
+
+if isORBPeriod
+    orbHigh := na(orbHigh) ? high : math.max(orbHigh, high)
+    orbLow := na(orbLow) ? low : math.min(orbLow, low)
+
+if not isORBPeriod and not na(orbHigh) and not na(orbLow)
+    orbSet := true
+
+orbRange = orbSet ? orbHigh - orbLow : na
+
+// ─── Volume Confirmation ───
+volSma = ta.sma(volume, i_volSmaLen)
+volOK  = not i_volConfirm or volume > volSma * i_volMult
+
+// ─── Breakout Conditions ───
+longBreakout  = orbSet and isAfterORB and not tradedToday and
+     close > orbHigh and volOK
+shortBreakout = orbSet and isAfterORB and not tradedToday and i_useShorts and
+     close < orbLow and volOK
+
+// ─── Position Sizing ───
+qty = math.floor((strategy.equity * i_posSize / 100.0) / close)
+qtyHalf = math.max(math.floor(qty / 2), 1)
+
+// ─── Targets and Stops ───
+longStop    = orbLow
+longTarget1 = orbSet ? orbHigh + orbRange * i_target1Mult : na
+longTarget2 = orbSet ? orbHigh + orbRange * i_target2Mult : na
+
+shortStop    = orbHigh
+shortTarget1 = orbSet ? orbLow - orbRange * i_target1Mult : na
+shortTarget2 = orbSet ? orbLow - orbRange * i_target2Mult : na
+
+// ─── Strategy Execution ───
+if longBreakout and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Close Short → ORB Long")
+    strategy.entry("Long", strategy.long, qty=qty, comment="ORB Breakout Long")
+    tradedToday := true
+
+if shortBreakout and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Close Long → ORB Short")
+    strategy.entry("Short", strategy.short, qty=qty, comment="ORB Breakout Short")
+    tradedToday := true
+
+// ─── Exits ───
+if strategy.position_size > 0 and orbSet
+    if i_splitTargets
+        strategy.exit("ORB LX1", "Long", qty=qtyHalf, stop=longStop, limit=longTarget1, comment="TP1/SL")
+        strategy.exit("ORB LX2", "Long", stop=longStop, limit=longTarget2, comment="TP2/SL")
+    else
+        strategy.exit("ORB LX", "Long", stop=longStop, limit=longTarget2, comment="TP/SL")
+
+if strategy.position_size < 0 and orbSet
+    if i_splitTargets
+        strategy.exit("ORB SX1", "Short", qty=qtyHalf, stop=shortStop, limit=shortTarget1, comment="TP1/SL")
+        strategy.exit("ORB SX2", "Short", stop=shortStop, limit=shortTarget2, comment="TP2/SL")
+    else
+        strategy.exit("ORB SX", "Short", stop=shortStop, limit=shortTarget2, comment="TP/SL")
+
+// Time-based exit before close
+if i_exitBeforeClose and isExitTime and strategy.position_size != 0
+    strategy.close_all(comment="EOD Exit")
+
+// ─── Plots ───
+orbHighLine = plot(orbSet ? orbHigh : na, "ORB High", color=color.new(color.green, 0),
+                   style=plot.style_linebr, linewidth=2)
+orbLowLine  = plot(orbSet ? orbLow : na, "ORB Low", color=color.new(color.red, 0),
+                   style=plot.style_linebr, linewidth=2)
+fill(orbHighLine, orbLowLine, color=color.new(color.blue, 90), title="ORB Range Fill")
+
+plot(orbSet and strategy.position_size > 0 ? longTarget1 : na, "Long T1",
+     color=color.new(color.lime, 30), style=plot.style_linebr, linewidth=1)
+plot(orbSet and strategy.position_size > 0 ? longTarget2 : na, "Long T2",
+     color=color.new(color.lime, 0), style=plot.style_linebr, linewidth=1)
+plot(orbSet and strategy.position_size < 0 ? shortTarget1 : na, "Short T1",
+     color=color.new(color.fuchsia, 30), style=plot.style_linebr, linewidth=1)
+plot(orbSet and strategy.position_size < 0 ? shortTarget2 : na, "Short T2",
+     color=color.new(color.fuchsia, 0), style=plot.style_linebr, linewidth=1)
+
+// ─── Background ───
+bgcolor(isORBPeriod ? color.new(color.yellow, 92) : na, title="ORB Period BG")
+
+// ─── Entry Markers ───
+plotshape(longBreakout and strategy.position_size <= 0, "ORB Long", shape.triangleup,
+          location.belowbar, color.green, size=size.small, text="ORB↑")
+plotshape(shortBreakout and strategy.position_size >= 0, "ORB Short", shape.triangledown,
+          location.abovebar, color.red, size=size.small, text="ORB↓")
+
+// ─── Dashboard ───
+if i_showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 80),
+                               border_width=1, border_color=color.gray)
+
+    table.cell(dash, 0, 0, "Metric", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "Value", text_color=color.white, text_size=size.small)
+
+    table.cell(dash, 0, 1, "ORB High", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, orbSet ? str.tostring(orbHigh, "#.##") : "—", text_color=color.green, text_size=size.small)
+
+    table.cell(dash, 0, 2, "ORB Low", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, orbSet ? str.tostring(orbLow, "#.##") : "—", text_color=color.red, text_size=size.small)
+
+    table.cell(dash, 0, 3, "Range", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, orbSet ? str.tostring(orbRange, "#.##") : "—", text_color=color.aqua, text_size=size.small)
+
+    posText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    posCol = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(dash, 0, 4, "Position", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, posText, text_color=posCol, text_size=size.small)
+
+// ─── Alerts ───
+alertcondition(longBreakout, title="ORB Long Breakout",
+     message='{"symbol":"{{ticker}}","action":"buy","price":{{close}},"strategy":"orb","signal":"orb_long"}')
+alertcondition(shortBreakout, title="ORB Short Breakout",
+     message='{"symbol":"{{ticker}}","action":"sell","price":{{close}},"strategy":"orb","signal":"orb_short"}')

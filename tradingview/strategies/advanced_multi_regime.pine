@@ -1,0 +1,240 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © stocks_plugin
+
+//@version=5
+strategy("Multi-Regime Trend + Mean Reversion [Advanced]", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         initial_capital=100000, commission_type=strategy.commission.percent,
+         commission_value=0.1, slippage=1)
+
+// ─── Regime Detection Inputs ───
+i_adxLen        = input.int(14, "ADX Length", minval=1, group="Regime", tooltip="ADX lookback for regime classification. Standard: 14.")
+i_adxTrend      = input.float(25.0, "ADX Trending Threshold", step=1.0, group="Regime", tooltip="ADX above this = TRENDING. Uses EMA crossover entries.")
+i_adxRange      = input.float(20.0, "ADX Ranging Threshold", step=1.0, group="Regime", tooltip="ADX below this = RANGING. Uses BB + RSI mean-reversion entries.")
+i_atrLen        = input.int(14, "ATR Length", minval=1, group="Regime", tooltip="ATR lookback for volatility measurement and stop/target calculation.")
+i_atrVolMult    = input.float(1.5, "Volatility ATR Multiplier", step=0.1, group="Regime", tooltip="ATR > avg × this = VOLATILE regime. No new entries in volatile regime.")
+i_htfConfirm    = input.bool(true, "Use HTF Regime Confirmation", group="Regime", tooltip="Confirm regime on higher timeframe. Reduces false regime changes.")
+i_htfTF         = input.timeframe("D", "HTF Timeframe", group="Regime", tooltip="Higher timeframe for regime confirmation (e.g., D for daily).")
+
+// ─── Trend Strategy Inputs ───
+i_emaFast       = input.int(9, "Fast EMA", minval=1, group="Trend", tooltip="Fast EMA for crossover signals in trending regime.")
+i_emaSlow       = input.int(21, "Slow EMA", minval=1, group="Trend", tooltip="Slow EMA for crossover signals. Fast > Slow = bullish crossover.")
+i_ema200        = input.int(200, "Trend Filter EMA", minval=50, group="Trend", tooltip="Long EMA trend filter. Only long above, only short below.")
+i_trendATR      = input.float(2.0, "Trend ATR Stop Mult", step=0.1, group="Trend", tooltip="Stop distance = ATR × this. Defines risk per trade.")
+i_trendRR       = input.float(3.0, "Trend R:R Target", minval=1.0, step=0.5, group="Trend", tooltip="Risk-to-reward ratio. 3.0 = target 3× the stop distance.")
+
+// ─── Mean Reversion Inputs ───
+i_bbLen         = input.int(20, "BB Length", minval=1, group="Mean Reversion", tooltip="Bollinger Bands lookback for mean-reversion entries.")
+i_bbDev         = input.float(2.0, "BB Deviation", step=0.1, group="Mean Reversion", tooltip="BB standard deviation multiplier.")
+i_rsiLen        = input.int(14, "RSI Length", minval=1, group="Mean Reversion", tooltip="RSI lookback for overbought/oversold confirmation.")
+i_rsiOB         = input.float(70.0, "RSI OB", group="Mean Reversion", tooltip="RSI overbought level for short entries.")
+i_rsiOS         = input.float(30.0, "RSI OS", group="Mean Reversion", tooltip="RSI oversold level for long entries.")
+
+// ─── Risk Management Inputs ───
+i_posSize       = input.float(10.0, "Position Size %", minval=1.0, maxval=100.0, group="Risk", tooltip="Percentage of equity per trade.")
+i_useShorts     = input.bool(true, "Allow Shorts", group="Risk", tooltip="Enable short entries.")
+i_cooldownBars  = input.int(5, "Cooldown Bars After Loss", minval=0, maxval=50, group="Risk", tooltip="Pause trading for N bars after a losing trade. 0 = no cooldown.")
+i_maxDailyTrades = input.int(5, "Max Daily Trades", minval=1, maxval=20, group="Risk", tooltip="Maximum number of trades allowed per day.")
+
+// ─── Display ───
+i_showDash      = input.bool(true, "Show Dashboard", group="Display", tooltip="Show regime, ADX, RSI, squeeze, cooldown, and position status.")
+i_showBG        = input.bool(true, "Show Regime Background", group="Display", tooltip="Color background: green=trending, blue=ranging, orange=volatile, purple=squeeze.")
+
+// ─── Regime Calculation (Current Timeframe) ───
+[diP, diM, adx] = ta.dmi(i_adxLen, i_adxLen)
+atr             = ta.atr(i_atrLen)
+atrAvg          = ta.sma(atr, 50)
+volatile        = atr > atrAvg * i_atrVolMult
+
+trending = adx > i_adxTrend and not volatile
+ranging  = adx < i_adxRange and not volatile
+
+// ─── HTF Regime Confirmation ───
+htfADX = request.security(syminfo.tickerid, i_htfTF, adx)
+htfTrending = i_htfConfirm ? htfADX > i_adxTrend : true
+htfRanging  = i_htfConfirm ? htfADX < i_adxRange : true
+
+confirmedTrending = trending and htfTrending
+confirmedRanging  = ranging and htfRanging
+
+regimeStr = confirmedTrending ? "TRENDING" : confirmedRanging ? "RANGING" : volatile ? "VOLATILE" : "TRANSITION"
+
+// ─── Volatility Regime ───
+bbWidth = (ta.sma(close, i_bbLen) + ta.stdev(close, i_bbLen) * i_bbDev -
+           (ta.sma(close, i_bbLen) - ta.stdev(close, i_bbLen) * i_bbDev)) / ta.sma(close, i_bbLen) * 100
+bbWidthAvg = ta.sma(bbWidth, 50)
+isSqueeze = bbWidth < bbWidthAvg * 0.75
+
+// ─── Cooldown Tracking ───
+var int lastLossBar = 0
+var int tradeCountToday = 0
+var int lastTradeDay = 0
+
+if dayofmonth != lastTradeDay
+    tradeCountToday := 0
+    lastTradeDay := dayofmonth
+
+isLossTrade = strategy.closedtrades > 0 and
+     strategy.closedtrades.profit(strategy.closedtrades - 1) < 0 and
+     strategy.closedtrades != strategy.closedtrades[1]
+if isLossTrade
+    lastLossBar := bar_index
+
+cooldownActive = bar_index - lastLossBar < i_cooldownBars and lastLossBar > 0
+canTrade = not cooldownActive and tradeCountToday < i_maxDailyTrades
+
+// ─── Trend Strategy Components ───
+emaFast = ta.ema(close, i_emaFast)
+emaSlow = ta.ema(close, i_emaSlow)
+ema200  = ta.ema(close, i_ema200)
+
+trendBullish = close > ema200
+trendBearish = close < ema200
+
+trendLong  = confirmedTrending and ta.crossover(emaFast, emaSlow) and trendBullish and canTrade
+trendShort = confirmedTrending and ta.crossunder(emaFast, emaSlow) and trendBearish and i_useShorts and canTrade
+
+// ─── Mean Reversion Strategy Components ───
+bbBasis = ta.sma(close, i_bbLen)
+bbStd   = ta.stdev(close, i_bbLen)
+bbUp    = bbBasis + bbStd * i_bbDev
+bbLo    = bbBasis - bbStd * i_bbDev
+rsi     = ta.rsi(close, i_rsiLen)
+
+mrLong  = confirmedRanging and close <= bbLo and rsi < i_rsiOS and canTrade
+mrShort = confirmedRanging and close >= bbUp and rsi > i_rsiOB and i_useShorts and canTrade
+
+// ─── Position Sizing ───
+qty = math.floor((strategy.equity * i_posSize / 100.0) / close)
+
+// ─── ATR-Based Stops and 3:1 R:R Targets ───
+var float entryPrice = na
+var float stopPrice  = na
+var float targetPrice = na
+
+// ─── Strategy Execution ───
+// Trend entries with bracket-style exits
+if trendLong and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Close → Trend Long")
+    strategy.entry("Long", strategy.long, qty=qty, comment="Trend Long")
+    entryPrice := close
+    stopPrice := close - atr * i_trendATR
+    targetPrice := close + (atr * i_trendATR) * i_trendRR
+    tradeCountToday += 1
+
+if trendShort and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Close → Trend Short")
+    strategy.entry("Short", strategy.short, qty=qty, comment="Trend Short")
+    entryPrice := close
+    stopPrice := close + atr * i_trendATR
+    targetPrice := close - (atr * i_trendATR) * i_trendRR
+    tradeCountToday += 1
+
+// Mean reversion entries
+if mrLong and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Close → MR Long")
+    strategy.entry("Long", strategy.long, qty=qty, comment="MR Long")
+    entryPrice := close
+    stopPrice := close - atr * 1.5
+    targetPrice := bbBasis
+    tradeCountToday += 1
+
+if mrShort and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Close → MR Short")
+    strategy.entry("Short", strategy.short, qty=qty, comment="MR Short")
+    entryPrice := close
+    stopPrice := close + atr * 1.5
+    targetPrice := bbBasis
+    tradeCountToday += 1
+
+// ─── Exits ───
+if strategy.position_size > 0 and not na(stopPrice) and not na(targetPrice)
+    strategy.exit("Exit Long", "Long", stop=stopPrice, limit=targetPrice, comment="TP/SL")
+
+if strategy.position_size < 0 and not na(stopPrice) and not na(targetPrice)
+    strategy.exit("Exit Short", "Short", stop=stopPrice, limit=targetPrice, comment="TP/SL")
+
+// Reset on flat
+if strategy.position_size == 0
+    entryPrice := na
+    stopPrice := na
+    targetPrice := na
+
+// ─── Regime Background ───
+bgCol = i_showBG ?
+     confirmedTrending ? color.new(color.green, 90) :
+     confirmedRanging ? color.new(color.blue, 90) :
+     volatile ? color.new(color.orange, 90) :
+     isSqueeze ? color.new(color.purple, 92) :
+     color.new(color.gray, 95) : na
+bgcolor(bgCol, title="Regime BG")
+
+// ─── Plots ───
+plot(emaFast, "EMA Fast", color=color.new(color.teal, confirmedTrending ? 0 : 80), linewidth=2)
+plot(emaSlow, "EMA Slow", color=color.new(color.orange, confirmedTrending ? 0 : 80), linewidth=2)
+plot(ema200, "EMA 200", color=color.new(color.white, 50), linewidth=1)
+
+pUp = plot(bbUp, "BB Upper", color=color.new(color.red, confirmedRanging ? 20 : 90))
+pLo = plot(bbLo, "BB Lower", color=color.new(color.green, confirmedRanging ? 20 : 90))
+pMid = plot(bbBasis, "BB Mid", color=color.new(color.yellow, confirmedRanging ? 20 : 90))
+fill(pUp, pLo, color=color.new(color.purple, confirmedRanging ? 92 : 98))
+
+// ─── Entry Markers ───
+plotshape(trendLong and strategy.position_size <= 0, "Trend Long", shape.triangleup,
+          location.belowbar, color.green, size=size.small, text="TL")
+plotshape(trendShort and strategy.position_size >= 0, "Trend Short", shape.triangledown,
+          location.abovebar, color.red, size=size.small, text="TS")
+plotshape(mrLong and strategy.position_size <= 0, "MR Long", shape.diamond,
+          location.belowbar, color.lime, size=size.small, text="MR")
+plotshape(mrShort and strategy.position_size >= 0, "MR Short", shape.diamond,
+          location.abovebar, color.fuchsia, size=size.small, text="MR")
+
+// ─── Dashboard ───
+if i_showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 80),
+                               border_width=1, border_color=color.gray)
+
+    table.cell(dash, 0, 0, "Metric", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "Value", text_color=color.white, text_size=size.small)
+
+    rC = confirmedTrending ? color.green : confirmedRanging ? color.blue : volatile ? color.orange : color.gray
+    table.cell(dash, 0, 1, "Regime", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, regimeStr, text_color=rC, text_size=size.small)
+
+    table.cell(dash, 0, 2, "ADX", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(adx, "#.#"), text_color=color.aqua, text_size=size.small)
+
+    table.cell(dash, 0, 3, "RSI", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, str.tostring(rsi, "#.#"),
+         text_color=rsi > i_rsiOB ? color.red : rsi < i_rsiOS ? color.green : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 4, "BB Width %", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(bbWidth, "#.##"),
+         text_color=isSqueeze ? color.yellow : color.aqua, text_size=size.small)
+
+    table.cell(dash, 0, 5, "Squeeze", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, isSqueeze ? "YES" : "NO",
+         text_color=isSqueeze ? color.yellow : color.gray, text_size=size.small)
+
+    table.cell(dash, 0, 6, "Cooldown", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, cooldownActive ? "ACTIVE" : "OFF",
+         text_color=cooldownActive ? color.red : color.green, text_size=size.small)
+
+    posT = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    posC = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(dash, 0, 7, "Position", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 7, posT, text_color=posC, text_size=size.small)
+
+// ─── Alerts ───
+alertcondition(trendLong, title="Trend Long",
+     message='{"symbol":"{{ticker}}","action":"buy","price":{{close}},"strategy":"adv_multi_regime","regime":"TRENDING","signal":"trend_long"}')
+alertcondition(trendShort, title="Trend Short",
+     message='{"symbol":"{{ticker}}","action":"sell","price":{{close}},"strategy":"adv_multi_regime","regime":"TRENDING","signal":"trend_short"}')
+alertcondition(mrLong, title="MR Long",
+     message='{"symbol":"{{ticker}}","action":"buy","price":{{close}},"strategy":"adv_multi_regime","regime":"RANGING","signal":"mr_long"}')
+alertcondition(mrShort, title="MR Short",
+     message='{"symbol":"{{ticker}}","action":"sell","price":{{close}},"strategy":"adv_multi_regime","regime":"RANGING","signal":"mr_short"}')

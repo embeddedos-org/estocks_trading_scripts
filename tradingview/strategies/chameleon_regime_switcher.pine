@@ -1,0 +1,187 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © stocks_plugin
+
+//@version=5
+strategy("Chameleon: Multi-Strategy Regime Switcher", overlay=true,
+         default_qty_type=strategy.percent_of_equity, default_qty_value=10,
+         initial_capital=100000, commission_type=strategy.commission.percent,
+         commission_value=0.1, slippage=1)
+
+// ─── Regime Detection Inputs ───
+i_adxLength     = input.int(14, "ADX Length", minval=1, group="Regime Detection", tooltip="Lookback period for ADX regime classification. Higher = smoother, slower regime changes.")
+i_adxTrend      = input.float(25.0, "ADX Trending Threshold", minval=10.0, step=1.0, group="Regime Detection", tooltip="ADX above this value = TRENDING regime → uses EMA crossover strategy.")
+i_adxRange      = input.float(20.0, "ADX Ranging Threshold", minval=5.0, step=1.0, group="Regime Detection", tooltip="ADX below this value = RANGING regime → uses BB mean-reversion strategy.")
+i_atrLength     = input.int(14, "ATR Length", minval=1, group="Regime Detection", tooltip="ATR lookback for volatility measurement and trailing stop calculation.")
+i_atrVolMult    = input.float(1.5, "ATR Volatility Multiplier", minval=1.0, step=0.1, group="Regime Detection", tooltip="ATR > (avg ATR × this) = VOLATILE regime. Higher = less sensitive to volatility spikes.")
+
+// ─── Trend Strategy Inputs ───
+i_fastEMA       = input.int(9, "Fast EMA Length", minval=1, group="Trend Strategy", tooltip="Fast EMA for crossover signals in TRENDING regime. Lower = more responsive.")
+i_slowEMA       = input.int(21, "Slow EMA Length", minval=1, group="Trend Strategy", tooltip="Slow EMA for crossover signals. Fast crosses above slow = long entry.")
+i_trendATRMult  = input.float(2.0, "Trend ATR Stop Multiplier", minval=0.5, step=0.1, group="Trend Strategy", tooltip="Trailing stop distance = ATR × this multiplier. Higher = wider stop, fewer whipsaws.")
+i_trendRR       = input.float(2.0, "Trend R:R Ratio", minval=1.0, step=0.5, group="Trend Strategy", tooltip="Risk-to-reward target ratio for trend trades. 2.0 = target is 2× the stop distance.")
+
+// ─── Mean Reversion Strategy Inputs ───
+i_bbLength      = input.int(20, "BB Length", minval=1, group="Mean Reversion", tooltip="Bollinger Bands lookback period for mean-reversion entries in RANGING regime.")
+i_bbDev         = input.float(2.0, "BB Deviation", minval=0.5, step=0.1, group="Mean Reversion", tooltip="BB standard deviation multiplier. 2.0 = ~95% of price action contained within bands.")
+i_rsiLength     = input.int(14, "RSI Length", minval=1, group="Mean Reversion", tooltip="RSI confirmation period. Used to filter BB entries for oversold/overbought conditions.")
+i_rsiOB         = input.float(70.0, "RSI Overbought", minval=50.0, group="Mean Reversion", tooltip="RSI above this + price at BB upper = short entry signal in RANGING regime.")
+i_rsiOS         = input.float(30.0, "RSI Oversold", maxval=50.0, group="Mean Reversion", tooltip="RSI below this + price at BB lower = long entry signal in RANGING regime.")
+
+// ─── General Inputs ───
+i_posSize       = input.float(10.0, "Position Size (% of Equity)", minval=1.0, maxval=100.0, step=1.0, group="Risk", tooltip="Percentage of account equity used per trade. 10% = risk 10% of equity per position.")
+i_useShorts     = input.bool(true, "Allow Short Entries", group="Risk", tooltip="Enable/disable short selling. Disable for long-only accounts or retirement accounts.")
+i_showDash      = input.bool(true, "Show Dashboard", group="Display", tooltip="Show the info table with regime, ADX, RSI, ATR, and position status.")
+i_showRegimeBG  = input.bool(true, "Show Regime Background", group="Display", tooltip="Color chart background by regime: green=trending, blue=ranging, orange=volatile.")
+
+// ─── Regime Detection ───
+[diPlus, diMinus, adxValue] = ta.dmi(i_adxLength, i_adxLength)
+atrValue   = ta.atr(i_atrLength)
+atrSma     = ta.sma(atrValue, 50)
+isVolatile = atrValue > atrSma * i_atrVolMult
+
+// Regime classification
+isTrending = adxValue > i_adxTrend and not isVolatile
+isRanging  = adxValue < i_adxRange and not isVolatile
+// If neither trending nor ranging, or volatile → cautious / no trade
+
+regimeStr = isTrending ? "TRENDING" : isRanging ? "RANGING" : isVolatile ? "VOLATILE" : "TRANSITIONAL"
+
+// ─── Trend Strategy (EMA Crossover) — Active when TRENDING ───
+fastEMA = ta.ema(close, i_fastEMA)
+slowEMA = ta.ema(close, i_slowEMA)
+
+trendLongCond  = isTrending and ta.crossover(fastEMA, slowEMA)
+trendShortCond = isTrending and ta.crossunder(fastEMA, slowEMA) and i_useShorts
+
+// ─── Mean Reversion Strategy (BB + RSI) — Active when RANGING ───
+bbBasis = ta.sma(close, i_bbLength)
+bbStdev = ta.stdev(close, i_bbLength)
+bbUpper = bbBasis + bbStdev * i_bbDev
+bbLower = bbBasis - bbStdev * i_bbDev
+rsiValue = ta.rsi(close, i_rsiLength)
+
+mrLongCond  = isRanging and close <= bbLower and rsiValue < i_rsiOS
+mrShortCond = isRanging and close >= bbUpper and rsiValue > i_rsiOB and i_useShorts
+
+// ─── Combined Entry Conditions ───
+longCondition  = trendLongCond or mrLongCond
+shortCondition = trendShortCond or mrShortCond
+
+// ─── Position Sizing ───
+qty = math.floor((strategy.equity * i_posSize / 100.0) / close)
+
+// ─── Trailing Stops ───
+var float trailStopLong  = na
+var float trailStopShort = na
+
+if strategy.position_size > 0
+    newStop = close - atrValue * i_trendATRMult
+    trailStopLong := math.max(nz(trailStopLong[1], newStop), newStop)
+else
+    trailStopLong := na
+
+if strategy.position_size < 0
+    newStop = close + atrValue * i_trendATRMult
+    trailStopShort := math.min(nz(trailStopShort[1], newStop), newStop)
+else
+    trailStopShort := na
+
+// ─── Strategy Execution ───
+// Trend entries
+if trendLongCond and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Close Short → Trend Long")
+    strategy.entry("Long", strategy.long, qty=qty, comment="Trend Long")
+    trailStopLong := close - atrValue * i_trendATRMult
+
+if trendShortCond and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Close Long → Trend Short")
+    strategy.entry("Short", strategy.short, qty=qty, comment="Trend Short")
+    trailStopShort := close + atrValue * i_trendATRMult
+
+// Mean reversion entries
+if mrLongCond and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Close Short → MR Long")
+    strategy.entry("Long", strategy.long, qty=qty, comment="MR Long (BB Lower + RSI OS)")
+
+if mrShortCond and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Close Long → MR Short")
+    strategy.entry("Short", strategy.short, qty=qty, comment="MR Short (BB Upper + RSI OB)")
+
+// ─── Exits ───
+// Trend trailing stop
+if strategy.position_size > 0 and isTrending and not na(trailStopLong)
+    strategy.exit("Trend Trail LX", "Long", stop=trailStopLong, comment="Trend Trail Stop")
+
+if strategy.position_size < 0 and isTrending and not na(trailStopShort)
+    strategy.exit("Trend Trail SX", "Short", stop=trailStopShort, comment="Trend Trail Stop")
+
+// Mean reversion exit at BB basis
+mrLongExit  = isRanging and close >= bbBasis
+mrShortExit = isRanging and close <= bbBasis
+
+if strategy.position_size > 0 and mrLongExit
+    strategy.close("Long", comment="MR Exit at Mean")
+
+if strategy.position_size < 0 and mrShortExit
+    strategy.close("Short", comment="MR Exit at Mean")
+
+// ─── Regime Background ───
+regimeBG = i_showRegimeBG ?
+     isTrending ? color.new(color.green, 90) :
+     isRanging ? color.new(color.blue, 90) :
+     isVolatile ? color.new(color.orange, 90) :
+     color.new(color.gray, 95) : na
+bgcolor(regimeBG, title="Regime Background")
+
+// ─── Plots ───
+plot(fastEMA, "Fast EMA", color=color.new(color.teal, isTrending ? 0 : 80), linewidth=2)
+plot(slowEMA, "Slow EMA", color=color.new(color.orange, isTrending ? 0 : 80), linewidth=2)
+
+pUpper = plot(bbUpper, "BB Upper", color=color.new(color.red, isRanging ? 20 : 90), linewidth=1)
+pLower = plot(bbLower, "BB Lower", color=color.new(color.green, isRanging ? 20 : 90), linewidth=1)
+pBasis = plot(bbBasis, "BB Basis", color=color.new(color.yellow, isRanging ? 20 : 90), linewidth=1)
+fill(pUpper, pLower, color=color.new(color.purple, isRanging ? 92 : 98), title="BB Fill")
+
+plot(trailStopLong, "Trail Stop Long", color=color.green, style=plot.style_linebr, linewidth=2)
+plot(trailStopShort, "Trail Stop Short", color=color.red, style=plot.style_linebr, linewidth=2)
+
+// ─── Dashboard Table ───
+if i_showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 80),
+                               border_width=1, border_color=color.gray)
+
+    table.cell(dash, 0, 0, "Metric", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "Value", text_color=color.white, text_size=size.small)
+
+    regimeColor = isTrending ? color.green : isRanging ? color.blue : isVolatile ? color.orange : color.gray
+    table.cell(dash, 0, 1, "Regime", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, regimeStr, text_color=regimeColor, text_size=size.small)
+
+    table.cell(dash, 0, 2, "ADX", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, str.tostring(adxValue, "#.##"), text_color=color.aqua, text_size=size.small)
+
+    table.cell(dash, 0, 3, "RSI", text_color=color.white, text_size=size.small)
+    rsiColor = rsiValue > i_rsiOB ? color.red : rsiValue < i_rsiOS ? color.green : color.gray
+    table.cell(dash, 1, 3, str.tostring(rsiValue, "#.##"), text_color=rsiColor, text_size=size.small)
+
+    table.cell(dash, 0, 4, "ATR", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(atrValue, "#.##"), text_color=color.aqua, text_size=size.small)
+
+    posText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    posColor = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(dash, 0, 5, "Position", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, posText, text_color=posColor, text_size=size.small)
+
+// ─── Alerts for Webhook Integration ───
+alertcondition(trendLongCond, title="Trend Long Entry",
+     message='{"symbol":"{{ticker}}","action":"buy","price":{{close}},"strategy":"chameleon","regime":"TRENDING","signal":"trend_long"}')
+alertcondition(trendShortCond, title="Trend Short Entry",
+     message='{"symbol":"{{ticker}}","action":"sell","price":{{close}},"strategy":"chameleon","regime":"TRENDING","signal":"trend_short"}')
+alertcondition(mrLongCond, title="MR Long Entry",
+     message='{"symbol":"{{ticker}}","action":"buy","price":{{close}},"strategy":"chameleon","regime":"RANGING","signal":"mr_long"}')
+alertcondition(mrShortCond, title="MR Short Entry",
+     message='{"symbol":"{{ticker}}","action":"sell","price":{{close}},"strategy":"chameleon","regime":"RANGING","signal":"mr_short"}')

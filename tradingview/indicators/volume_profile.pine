@@ -1,0 +1,160 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © stocks_plugin
+
+//@version=5
+indicator("Volume Profile", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=50)
+
+// ─── Input Parameters ───
+i_session     = input.session("0930-1600", "Session Time")
+i_numRows     = input.int(24, "Number of Rows", minval=5, maxval=100)
+i_vaPercent   = input.float(70.0, "Value Area %", minval=50.0, maxval=95.0, step=5.0)
+i_profileWidth = input.int(50, "Profile Width (bars)", minval=10, maxval=200)
+i_showPOC     = input.bool(true, "Show POC Line")
+i_showVA      = input.bool(true, "Show Value Area Lines")
+i_pocColor    = input.color(color.yellow, "POC Color")
+i_vahColor    = input.color(color.teal, "VAH Color")
+i_valColor    = input.color(color.orange, "VAL Color")
+i_aboveColor  = input.color(color.green, "Above POC Color")
+i_belowColor  = input.color(color.red, "Below POC Color")
+
+// ─── Session Detection ───
+inSession    = not na(time(timeframe.period, i_session))
+sessionStart = inSession and not inSession[1]
+sessionEnd   = not inSession and inSession[1]
+
+// ─── Volume Profile Data Collection ───
+var float sessionHigh  = na
+var float sessionLow   = na
+var float[] rowVolumes = array.new_float(i_numRows, 0.0)
+var int   sessionBars  = 0
+var int   startBarIdx  = 0
+
+if sessionStart
+    sessionHigh := high
+    sessionLow  := low
+    sessionBars := 0
+    startBarIdx := bar_index
+    for i = 0 to i_numRows - 1
+        array.set(rowVolumes, i, 0.0)
+
+if inSession
+    sessionHigh := math.max(sessionHigh, high)
+    sessionLow  := math.min(sessionLow, low)
+    sessionBars += 1
+
+// ─── Distribute Volume into Rows ───
+if inSession and sessionHigh > sessionLow
+    priceRange = sessionHigh - sessionLow
+    rowHeight  = priceRange / i_numRows
+
+    barMid = (high + low) / 2.0
+    rowIdx = math.floor((barMid - sessionLow) / rowHeight)
+    rowIdx := math.max(0, math.min(rowIdx, i_numRows - 1))
+
+    currentVol = array.get(rowVolumes, rowIdx)
+    array.set(rowVolumes, rowIdx, currentVol + volume)
+
+    if high != low
+        barRows = math.max(1, math.round((high - low) / rowHeight))
+        volPerRow = volume / barRows
+        lowRow = math.max(0, math.floor((low - sessionLow) / rowHeight))
+        highRow = math.min(i_numRows - 1, math.floor((high - sessionLow) / rowHeight))
+        for r = lowRow to highRow
+            if r != rowIdx
+                rv = array.get(rowVolumes, r)
+                array.set(rowVolumes, r, rv + volPerRow)
+
+// ─── Calculate POC, VAH, VAL ───
+var float pocPrice = na
+var float vahPrice = na
+var float valPrice = na
+var int   pocIdx   = 0
+
+if sessionEnd and sessionHigh > sessionLow
+    priceRange = sessionHigh - sessionLow
+    rowHeight  = priceRange / i_numRows
+
+    maxVol  = 0.0
+    pocRow  = 0
+    totalVol = 0.0
+
+    for i = 0 to i_numRows - 1
+        v = array.get(rowVolumes, i)
+        totalVol += v
+        if v > maxVol
+            maxVol := v
+            pocRow := i
+
+    pocPrice := sessionLow + (pocRow + 0.5) * rowHeight
+    pocIdx   := pocRow
+
+    vaTarget   = totalVol * i_vaPercent / 100.0
+    vaVol      = array.get(rowVolumes, pocRow)
+    upperRow   = pocRow
+    lowerRow   = pocRow
+
+    while vaVol < vaTarget and (upperRow < i_numRows - 1 or lowerRow > 0)
+        upperVol = upperRow < i_numRows - 1 ? array.get(rowVolumes, upperRow + 1) : 0.0
+        lowerVol = lowerRow > 0 ? array.get(rowVolumes, lowerRow - 1) : 0.0
+
+        if upperVol >= lowerVol and upperRow < i_numRows - 1
+            upperRow += 1
+            vaVol += upperVol
+        else if lowerRow > 0
+            lowerRow -= 1
+            vaVol += lowerVol
+        else
+            upperRow += 1
+            vaVol += upperVol
+
+    vahPrice := sessionLow + (upperRow + 1) * rowHeight
+    valPrice := sessionLow + lowerRow * rowHeight
+
+    // ─── Draw Volume Profile Histogram ───
+    maxRowVol = 0.0
+    for i = 0 to i_numRows - 1
+        maxRowVol := math.max(maxRowVol, array.get(rowVolumes, i))
+
+    if maxRowVol > 0
+        for i = 0 to i_numRows - 1
+            rowVol   = array.get(rowVolumes, i)
+            rowBot   = sessionLow + i * rowHeight
+            rowTop   = sessionLow + (i + 1) * rowHeight
+            barWidth = math.round(rowVol / maxRowVol * i_profileWidth)
+            barWidth := math.max(barWidth, 1)
+
+            boxColor = i > pocIdx ? i_aboveColor : i < pocIdx ? i_belowColor : i_pocColor
+            boxTrans = i == pocIdx ? 30 : 60
+
+            box.new(bar_index - barWidth, rowTop, bar_index, rowBot,
+                     border_color=color.new(boxColor, boxTrans + 10),
+                     bgcolor=color.new(boxColor, boxTrans),
+                     border_width=1)
+
+    // ─── Draw POC, VAH, VAL Lines ───
+    lineLen = bar_index - startBarIdx
+
+    if i_showPOC
+        line.new(startBarIdx, pocPrice, bar_index, pocPrice,
+                 color=i_pocColor, width=2, style=line.style_solid)
+        label.new(bar_index, pocPrice, "POC", style=label.style_label_left,
+                  color=color.new(i_pocColor, 50), textcolor=color.white, size=size.small)
+
+    if i_showVA
+        line.new(startBarIdx, vahPrice, bar_index, vahPrice,
+                 color=i_vahColor, width=1, style=line.style_dashed)
+        label.new(bar_index, vahPrice, "VAH", style=label.style_label_left,
+                  color=color.new(i_vahColor, 50), textcolor=color.white, size=size.small)
+
+        line.new(startBarIdx, valPrice, bar_index, valPrice,
+                 color=i_valColor, width=1, style=line.style_dashed)
+        label.new(bar_index, valPrice, "VAL", style=label.style_label_left,
+                  color=color.new(i_valColor, 50), textcolor=color.white, size=size.small)
+
+// ─── Plot Persistent Levels ───
+plot(i_showPOC ? pocPrice : na, "POC", color=color.new(i_pocColor, 50), style=plot.style_stepline, linewidth=1)
+plot(i_showVA ? vahPrice : na, "VAH", color=color.new(i_vahColor, 50), style=plot.style_stepline, linewidth=1)
+plot(i_showVA ? valPrice : na, "VAL", color=color.new(i_valColor, 50), style=plot.style_stepline, linewidth=1)
+
+// ─── Session Background ───
+bgcolor(inSession ? color.new(color.blue, 95) : na, title="Session Background")

@@ -1,0 +1,154 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © stocks_plugin
+
+//@version=5
+indicator("Market Structure (BOS / ChoCH)", overlay=true, max_lines_count=500,
+          max_boxes_count=500, max_labels_count=500)
+
+// ─── Input Parameters ───
+i_leftBars    = input.int(5, "Pivot Left Bars", minval=1)
+i_rightBars   = input.int(5, "Pivot Right Bars", minval=1)
+i_showSwings  = input.bool(true, "Show Swing Points")
+i_showBOS     = input.bool(true, "Show BOS Lines")
+i_showChoCH   = input.bool(true, "Show ChoCH Lines")
+i_showOB      = input.bool(true, "Show Order Blocks")
+i_obTransp    = input.int(80, "Order Block Transparency", minval=50, maxval=95)
+i_bullColor   = input.color(color.green, "Bullish Color")
+i_bearColor   = input.color(color.red, "Bearish Color")
+
+// ─── State Variables ───
+var float lastSwingHigh     = na
+var int   lastSwingHighBar  = na
+var float lastSwingLow      = na
+var int   lastSwingLowBar   = na
+var float prevSwingHigh     = na
+var int   prevSwingHighBar  = na
+var float prevSwingLow      = na
+var int   prevSwingLowBar   = na
+var int   trend             = 0  // 1 = bullish, -1 = bearish, 0 = undefined
+
+// ─── Swing Detection ───
+swingHigh = ta.pivothigh(high, i_leftBars, i_rightBars)
+swingLow  = ta.pivotlow(low, i_leftBars, i_rightBars)
+
+pivotOffset = i_rightBars
+
+// ─── Process Swing Highs ───
+if not na(swingHigh)
+    prevSwingHigh    := lastSwingHigh
+    prevSwingHighBar := lastSwingHighBar
+    lastSwingHigh    := swingHigh
+    lastSwingHighBar := bar_index - pivotOffset
+
+    if i_showSwings
+        label.new(bar_index - pivotOffset, swingHigh, "HH",
+                  style=label.style_circle, color=i_bullColor,
+                  textcolor=color.white, size=size.tiny)
+
+// ─── Process Swing Lows ───
+if not na(swingLow)
+    prevSwingLow    := lastSwingLow
+    prevSwingLowBar := lastSwingLowBar
+    lastSwingLow    := swingLow
+    lastSwingLowBar := bar_index - pivotOffset
+
+    if i_showSwings
+        label.new(bar_index - pivotOffset, swingLow, "LL",
+                  style=label.style_circle, color=i_bearColor,
+                  textcolor=color.white, size=size.tiny)
+
+// ─── Break of Structure (BOS) Detection ───
+bullishBOS = false
+bearishBOS = false
+
+// Bullish BOS: close breaks above previous swing high
+if not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+    bullishBOS := true
+
+// Bearish BOS: close breaks below previous swing low
+if not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+    bearishBOS := true
+
+// ─── Change of Character (ChoCH) Detection ───
+bullishChoCH = false
+bearishChoCH = false
+
+// ChoCH: first break against prevailing trend
+if bullishBOS and trend == -1
+    bullishChoCH := true
+    bullishBOS   := false
+
+if bearishBOS and trend == 1
+    bearishChoCH := true
+    bearishBOS   := false
+
+// ─── Update Trend ───
+if bullishBOS or bullishChoCH
+    trend := 1
+if bearishBOS or bearishChoCH
+    trend := -1
+
+// ─── Draw BOS Lines ───
+if bullishBOS and i_showBOS and not na(lastSwingHighBar)
+    line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh,
+             color=i_bullColor, width=2, style=line.style_solid)
+    label.new(bar_index, lastSwingHigh, "BOS", style=label.style_label_down,
+              color=color.new(i_bullColor, 30), textcolor=color.white, size=size.small)
+
+if bearishBOS and i_showBOS and not na(lastSwingLowBar)
+    line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow,
+             color=i_bearColor, width=2, style=line.style_solid)
+    label.new(bar_index, lastSwingLow, "BOS", style=label.style_label_up,
+              color=color.new(i_bearColor, 30), textcolor=color.white, size=size.small)
+
+// ─── Draw ChoCH Lines ───
+if bullishChoCH and i_showChoCH and not na(lastSwingHighBar)
+    line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh,
+             color=i_bullColor, width=2, style=line.style_dashed)
+    label.new(bar_index, lastSwingHigh, "ChoCH", style=label.style_label_down,
+              color=color.new(i_bullColor, 10), textcolor=color.white, size=size.small)
+
+if bearishChoCH and i_showChoCH and not na(lastSwingLowBar)
+    line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow,
+             color=i_bearColor, width=2, style=line.style_dashed)
+    label.new(bar_index, lastSwingLow, "ChoCH", style=label.style_label_up,
+              color=color.new(i_bearColor, 10), textcolor=color.white, size=size.small)
+
+// ─── Order Block Detection ───
+// Last opposing candle before BOS
+if bullishBOS and i_showOB
+    obIdx = bar_index - 1
+    for i = 1 to 10
+        if close[i] < open[i]  // last bearish candle before bullish BOS
+            obTop    = open[i]
+            obBottom = close[i]
+            box.new(bar_index - i, obTop, bar_index + 10, obBottom,
+                     border_color=color.new(i_bullColor, i_obTransp - 20),
+                     bgcolor=color.new(i_bullColor, i_obTransp),
+                     border_width=1)
+            label.new(bar_index - i, obTop, "OB", style=label.style_label_down,
+                      color=color.new(i_bullColor, 50), textcolor=color.white, size=size.tiny)
+            break
+
+if bearishBOS and i_showOB
+    for i = 1 to 10
+        if close[i] > open[i]  // last bullish candle before bearish BOS
+            obTop    = close[i]
+            obBottom = open[i]
+            box.new(bar_index - i, obTop, bar_index + 10, obBottom,
+                     border_color=color.new(i_bearColor, i_obTransp - 20),
+                     bgcolor=color.new(i_bearColor, i_obTransp),
+                     border_width=1)
+            label.new(bar_index - i, obBottom, "OB", style=label.style_label_up,
+                      color=color.new(i_bearColor, 50), textcolor=color.white, size=size.tiny)
+            break
+
+// ─── Trend Background ───
+bgColor = trend == 1 ? color.new(i_bullColor, 95) : trend == -1 ? color.new(i_bearColor, 95) : na
+bgcolor(bgColor, title="Trend Background")
+
+// ─── Alerts ───
+alertcondition(bullishBOS, title="Bullish BOS", message="Market Structure: Bullish Break of Structure on {{ticker}}")
+alertcondition(bearishBOS, title="Bearish BOS", message="Market Structure: Bearish Break of Structure on {{ticker}}")
+alertcondition(bullishChoCH, title="Bullish ChoCH", message="Market Structure: Bullish Change of Character on {{ticker}}")
+alertcondition(bearishChoCH, title="Bearish ChoCH", message="Market Structure: Bearish Change of Character on {{ticker}}")

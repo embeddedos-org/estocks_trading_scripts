@@ -1,0 +1,59 @@
+# =============================================================================
+# stocks_plugin — Master Configuration
+# =============================================================================
+# Copy this file to config.yaml and fill in your credentials.
+# Environment variables (see .env.example) override values set here.
+
+brokers:
+  ib:
+    host: "127.0.0.1"
+    port: 7497          # 7497 = paper TWS, 7496 = live TWS, 4002 = paper Gateway
+    client_id: 1
+    account: ""
+    mode: "paper"       # paper | live
+
+  tradestation:
+    client_id: ""
+    client_secret: ""
+    redirect_uri: "http://localhost:3000/callback"
+
+  schwab:
+    app_key: ""
+    app_secret: ""
+
+notifications:
+  enabled_channels:
+    - console
+    # - discord
+    # - email
+    # - sms
+
+  discord:
+    webhook_url: ""
+
+  email:
+    smtp_host: "smtp.gmail.com"
+    smtp_port: 587
+    smtp_user: ""
+    smtp_password: ""
+    smtp_from: ""
+    smtp_to: ""
+
+  sms:
+    account_sid: ""
+    auth_token: ""
+    from_number: ""
+    to_number: ""
+
+  console:
+    enabled: true
+
+strategies:
+  default_position_size_pct: 2.0    # % of portfolio per trade
+  max_daily_loss_pct: 5.0           # circuit-breaker: stop trading after X% daily loss
+  max_position_pct: 10.0            # max single-position size as % of portfolio
+
+webhook:
+  port: 8000
+  hmac_secret: ""
+  rate_limit_per_minute: 30

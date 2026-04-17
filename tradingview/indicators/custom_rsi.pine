@@ -1,0 +1,106 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © stocks_plugin
+
+//@version=5
+indicator("Custom RSI with Divergence", overlay=false)
+
+// ─── Input Parameters ───
+i_rsiLength   = input.int(14, "RSI Length", minval=1)
+i_obLevel     = input.float(70.0, "Overbought Level", minval=50.0, maxval=100.0)
+i_osLevel     = input.float(30.0, "Oversold Level", minval=0.0, maxval=50.0)
+i_divLookback = input.int(5, "Divergence Lookback (pivot)", minval=2, maxval=20)
+i_atrLength   = input.int(14, "ATR Length (dynamic OB/OS)", minval=1)
+i_atrScale    = input.float(0.5, "ATR Scale Factor", minval=0.1, maxval=2.0, step=0.1)
+i_useDynamic  = input.bool(true, "Use Dynamic OB/OS Levels")
+i_mtfTF       = input.timeframe("D", "MTF RSI Timeframe")
+i_showMTF     = input.bool(true, "Show MTF RSI")
+i_src         = input.source(close, "Source")
+
+// ─── RSI Calculation ───
+rsiValue = ta.rsi(i_src, i_rsiLength)
+
+// ─── Multi-Timeframe RSI ───
+mtfRsi = request.security(syminfo.tickerid, i_mtfTF, ta.rsi(close, i_rsiLength), lookahead=barmerge.lookahead_off)
+
+// ─── Dynamic OB/OS Levels via ATR ───
+atrValue = ta.atr(i_atrLength)
+atrSma   = ta.sma(atrValue, 50)
+atrRatio = atrValue / math.max(atrSma, 0.0001)
+
+dynOB = i_useDynamic ? math.min(90, i_obLevel + (atrRatio - 1.0) * 10 * i_atrScale) : i_obLevel
+dynOS = i_useDynamic ? math.max(10, i_osLevel - (atrRatio - 1.0) * 10 * i_atrScale) : i_osLevel
+
+// ─── Pivot Points for Divergence ───
+rsiPivotLow  = ta.pivotlow(rsiValue, i_divLookback, i_divLookback)
+rsiPivotHigh = ta.pivothigh(rsiValue, i_divLookback, i_divLookback)
+
+pricePivotLow  = ta.pivotlow(low, i_divLookback, i_divLookback)
+pricePivotHigh = ta.pivothigh(high, i_divLookback, i_divLookback)
+
+// ─── Divergence Detection ───
+var float prevRsiLow    = na
+var float prevPriceLow  = na
+var float prevRsiHigh   = na
+var float prevPriceHigh = na
+
+bullishDiv = false
+bearishDiv = false
+
+if not na(rsiPivotLow) and not na(pricePivotLow)
+    if not na(prevRsiLow) and not na(prevPriceLow)
+        if pricePivotLow < prevPriceLow and rsiPivotLow > prevRsiLow
+            bullishDiv := true
+    prevRsiLow   := rsiPivotLow
+    prevPriceLow := pricePivotLow
+
+if not na(rsiPivotHigh) and not na(pricePivotHigh)
+    if not na(prevRsiHigh) and not na(prevPriceHigh)
+        if pricePivotHigh > prevPriceHigh and rsiPivotHigh < prevRsiHigh
+            bearishDiv := true
+    prevRsiHigh   := rsiPivotHigh
+    prevPriceHigh := pricePivotHigh
+
+// ─── RSI Plot ───
+rsiPlot = plot(rsiValue, "RSI", color=color.new(color.blue, 0), linewidth=2)
+
+// ─── MTF RSI Plot ───
+plot(i_showMTF ? mtfRsi : na, "MTF RSI", color=color.new(color.purple, 30), linewidth=1, style=plot.style_stepline)
+
+// ─── Dynamic OB/OS Levels ───
+obPlot = plot(dynOB, "Overbought", color=color.new(color.red, 50), linewidth=1)
+osPlot = plot(dynOS, "Oversold", color=color.new(color.green, 50), linewidth=1)
+
+// ─── Mid Line ───
+midLine = plot(50.0, "Mid Line", color=color.new(color.gray, 60), linewidth=1, style=plot.style_cross)
+
+// ─── Gradient Fill for OB/OS Zones ───
+topBand = plot(100, "Top", display=display.none)
+botBand = plot(0, "Bottom", display=display.none)
+
+fill(topBand, obPlot, color=color.new(color.red, 85), title="OB Zone Fill")
+fill(osPlot, botBand, color=color.new(color.green, 85), title="OS Zone Fill")
+fill(obPlot, osPlot, color=color.new(color.gray, 95), title="Neutral Zone Fill")
+
+// ─── RSI Color Based on Level ───
+rsiColor = rsiValue >= dynOB ? color.red : rsiValue <= dynOS ? color.green : color.blue
+fill(rsiPlot, midLine, color=rsiValue >= 50 ? color.new(color.green, 85) : color.new(color.red, 85), title="RSI Fill")
+
+// ─── Divergence Arrows ───
+plotshape(bullishDiv, title="Bullish Divergence", style=shape.triangleup,
+          location=location.bottom, color=color.green, size=size.small,
+          text="Bull Div", textcolor=color.green, offset=-i_divLookback)
+
+plotshape(bearishDiv, title="Bearish Divergence", style=shape.triangledown,
+          location=location.top, color=color.red, size=size.small,
+          text="Bear Div", textcolor=color.red, offset=-i_divLookback)
+
+// ─── Horizontal Reference Lines ───
+hline(100, "100", color=color.new(color.gray, 80), linestyle=hline.style_dotted)
+hline(0, "0", color=color.new(color.gray, 80), linestyle=hline.style_dotted)
+hline(50, "50", color=color.new(color.gray, 70), linestyle=hline.style_dotted)
+
+// ─── Alert Conditions ───
+alertcondition(bullishDiv, title="Bullish Divergence", message="Custom RSI: Bullish divergence detected on {{ticker}}")
+alertcondition(bearishDiv, title="Bearish Divergence", message="Custom RSI: Bearish divergence detected on {{ticker}}")
+alertcondition(ta.crossover(rsiValue, dynOB), title="RSI Overbought Cross", message="RSI crossed above overbought on {{ticker}}")
+alertcondition(ta.crossunder(rsiValue, dynOS), title="RSI Oversold Cross", message="RSI crossed below oversold on {{ticker}}")

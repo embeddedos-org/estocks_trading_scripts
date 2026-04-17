@@ -1,0 +1,98 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © stocks_plugin
+
+//@version=5
+indicator("VWAP with Deviation Bands", overlay=true, timeframe="", timeframe_gaps=true)
+
+// ─── Inputs ───
+i_showVWAP      = input.bool(true, "Show VWAP Line", group="Display", tooltip="Show the main VWAP line (yellow).")
+i_showBands     = input.bool(true, "Show Deviation Bands", group="Display", tooltip="Master toggle for all standard deviation bands.")
+i_show1SD       = input.bool(true, "Show ±1σ Bands", group="Display", tooltip="Show ±1 standard deviation bands. ~68% of price action contained.")
+i_show2SD       = input.bool(true, "Show ±2σ Bands", group="Display", tooltip="Show ±2 standard deviation bands. ~95% of price action contained.")
+i_show3SD       = input.bool(true, "Show ±3σ Bands", group="Display", tooltip="Show ±3 standard deviation bands. ~99.7% — extreme extension levels.")
+i_showLabel     = input.bool(true, "Show Distance Label", group="Display", tooltip="Show label with % distance from VWAP and σ deviation.")
+i_anchor        = input.string("Session", "Anchor Period", options=["Session", "Week", "Month"], group="Settings", tooltip="VWAP reset period. Session=daily, Week=weekly anchor, Month=monthly anchor.")
+i_src           = input.source(hlc3, "Source", group="Settings", tooltip="Price source for VWAP calculation. HLC3 (typical price) is standard.")
+
+// ─── VWAP Calculation (Manual for anchoring control) ───
+isNewPeriod = switch i_anchor
+    "Session" => ta.change(time("D")) != 0
+    "Week"    => ta.change(time("W")) != 0
+    "Month"   => ta.change(time("M")) != 0
+    => ta.change(time("D")) != 0
+
+var float cumVol   = 0.0
+var float cumTP    = 0.0
+var float cumTP2   = 0.0
+
+if isNewPeriod
+    cumVol := 0.0
+    cumTP := 0.0
+    cumTP2 := 0.0
+
+cumVol += volume
+cumTP += i_src * volume
+cumTP2 += i_src * i_src * volume
+
+vwapValue = cumVol > 0 ? cumTP / cumVol : na
+variance  = cumVol > 0 ? math.max(cumTP2 / cumVol - vwapValue * vwapValue, 0) : 0
+stdev     = math.sqrt(variance)
+
+// ─── Deviation Bands ───
+band1Up = vwapValue + stdev
+band1Dn = vwapValue - stdev
+band2Up = vwapValue + stdev * 2
+band2Dn = vwapValue - stdev * 2
+band3Up = vwapValue + stdev * 3
+band3Dn = vwapValue - stdev * 3
+
+// ─── Plots ───
+vwapPlot = plot(i_showVWAP ? vwapValue : na, "VWAP", color=color.new(color.yellow, 0), linewidth=2)
+
+p1Up = plot(i_showBands and i_show1SD ? band1Up : na, "+1σ", color=color.new(color.aqua, 40), linewidth=1)
+p1Dn = plot(i_showBands and i_show1SD ? band1Dn : na, "-1σ", color=color.new(color.aqua, 40), linewidth=1)
+p2Up = plot(i_showBands and i_show2SD ? band2Up : na, "+2σ", color=color.new(color.orange, 40), linewidth=1)
+p2Dn = plot(i_showBands and i_show2SD ? band2Dn : na, "-2σ", color=color.new(color.orange, 40), linewidth=1)
+p3Up = plot(i_showBands and i_show3SD ? band3Up : na, "+3σ", color=color.new(color.red, 40), linewidth=1)
+p3Dn = plot(i_showBands and i_show3SD ? band3Dn : na, "-3σ", color=color.new(color.red, 40), linewidth=1)
+
+// ─── Fills ───
+fill(p1Up, vwapPlot, color=color.new(color.aqua, 92), title="1σ Upper Fill")
+fill(vwapPlot, p1Dn, color=color.new(color.aqua, 92), title="1σ Lower Fill")
+fill(p2Up, p1Up, color=color.new(color.orange, 95), title="2σ Upper Fill")
+fill(p1Dn, p2Dn, color=color.new(color.orange, 95), title="2σ Lower Fill")
+fill(p3Up, p2Up, color=color.new(color.red, 96), title="3σ Upper Fill")
+fill(p2Dn, p3Dn, color=color.new(color.red, 96), title="3σ Lower Fill")
+
+// ─── Distance from VWAP Label ───
+if i_showLabel and barstate.islast and not na(vwapValue)
+    distPct = (close - vwapValue) / vwapValue * 100
+    distSD = stdev > 0 ? (close - vwapValue) / stdev : 0
+
+    labelColor = distPct > 0 ? color.green : color.red
+    labelText = "VWAP Dist: " + str.tostring(distPct, "#.##") + "%\n" +
+         "σ: " + str.tostring(distSD, "#.##")
+
+    var label distLabel = na
+    label.delete(distLabel)
+    distLabel := label.new(bar_index + 3, close, labelText,
+         style=label.style_label_left, color=color.new(color.black, 60),
+         textcolor=labelColor, size=size.normal)
+
+// ─── Alerts ───
+crossAbove2SD = ta.crossover(close, band2Up)
+crossBelow2SD = ta.crossunder(close, band2Dn)
+crossAbove3SD = ta.crossover(close, band3Up)
+crossBelow3SD = ta.crossunder(close, band3Dn)
+crossVWAP     = ta.cross(close, vwapValue)
+
+alertcondition(crossAbove2SD, title="Price Above +2σ",
+     message="{{ticker}}: Price crossed above VWAP +2σ at {{close}}")
+alertcondition(crossBelow2SD, title="Price Below -2σ",
+     message="{{ticker}}: Price crossed below VWAP -2σ at {{close}}")
+alertcondition(crossAbove3SD, title="Price Above +3σ",
+     message="{{ticker}}: Price crossed above VWAP +3σ at {{close}}")
+alertcondition(crossBelow3SD, title="Price Below -3σ",
+     message="{{ticker}}: Price crossed below VWAP -3σ at {{close}}")
+alertcondition(crossVWAP, title="VWAP Cross",
+     message="{{ticker}}: Price crossed VWAP at {{close}}")

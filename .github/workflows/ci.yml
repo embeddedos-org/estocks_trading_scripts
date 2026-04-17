@@ -1,0 +1,120 @@
+name: CI — Tests & Coverage
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest-cov
+
+      - name: Lint — syntax check
+        run: |
+          python -m py_compile shared/__init__.py
+          python -m py_compile strategies/__init__.py
+          python -m py_compile strategies/runner.py
+          python -m py_compile shared/backtesting/backtest_engine_v2.py
+
+      - name: Run tests with coverage
+        run: |
+          pytest --cov=shared --cov=strategies --cov-report=term-missing --cov-report=xml -v
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-py${{ matrix.python-version }}
+          path: coverage.xml
+
+  release:
+    needs: test
+    runs-on: windows-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate version tag
+        id: version
+        shell: pwsh
+        run: |
+          $date = Get-Date -Format "yyyy.MM.dd"
+          $sha = git rev-parse --short HEAD
+          $count = (git rev-list --count HEAD)
+          $version = "v${date}.${count}"
+          echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+          echo "SHA=$sha" >> $env:GITHUB_OUTPUT
+          echo "Generated version: $version ($sha)"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build distribution archive
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          $archiveName = "stocks_plugin-${version}.zip"
+          Compress-Archive -Path shared, strategies, interactive_brokers, tradingview, tradestation, thinkorswim, backtrader_adapter, freqtrade_adapter, lean_adapter, zipline_adapter, portfolio_backtester, requirements.txt, pyproject.toml, README.md, docs -DestinationPath $archiveName
+          echo "ARCHIVE=$archiveName" >> $env:GITHUB_OUTPUT
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: coverage-artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: "Release ${{ steps.version.outputs.VERSION }}"
+          body: |
+            ## stocks_plugin ${{ steps.version.outputs.VERSION }}
+
+            **Commit:** ${{ steps.version.outputs.SHA }}
+            **Tests:** Passed on Windows (Python 3.10 + 3.12)
+
+            ### What's included
+            - All strategy modules (trend_following, mean_reversion, breakout, factor, ml, rl)
+            - BacktestEngineV2 with full metrics
+            - Interactive Brokers integration (ib-async)
+            - TradingView / TradeStation / thinkorswim adapters
+            - Portfolio backtester & risk management
+
+            ### Install
+            ```bash
+            pip install -r requirements.txt
+            ```
+          files: |
+            stocks_plugin-${{ steps.version.outputs.VERSION }}.zip
+          draft: false
+          prerelease: false

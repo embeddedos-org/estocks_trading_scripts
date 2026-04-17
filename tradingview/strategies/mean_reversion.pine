@@ -1,0 +1,109 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// © stocks_plugin
+
+//@version=5
+strategy("Mean Reversion Strategy", overlay=true, default_qty_type=strategy.percent_of_equity,
+         default_qty_value=10, initial_capital=100000, commission_type=strategy.commission.percent,
+         commission_value=0.1, slippage=1)
+
+// ─── Input Parameters ───
+i_bbLength   = input.int(20, "BB Lookback Period", minval=1)
+i_bbDev      = input.float(2.0, "BB Deviation Multiplier", minval=0.1, step=0.1)
+i_rsiLength  = input.int(14, "RSI Length", minval=1)
+i_rsiOB      = input.float(70.0, "RSI Overbought Level", minval=50.0, maxval=100.0)
+i_rsiOS      = input.float(30.0, "RSI Oversold Level", minval=0.0, maxval=50.0)
+i_posSize    = input.float(10.0, "Position Size (% of Equity)", minval=1.0, maxval=100.0, step=1.0)
+i_useShorts  = input.bool(true, "Allow Short Entries")
+i_src        = input.source(close, "Source")
+
+// ─── Bollinger Bands ───
+bbBasis = ta.sma(i_src, i_bbLength)
+bbStdev = ta.stdev(i_src, i_bbLength)
+bbUpper = bbBasis + bbStdev * i_bbDev
+bbLower = bbBasis - bbStdev * i_bbDev
+bbWidth = (bbUpper - bbLower) / bbBasis * 100
+
+// ─── RSI ───
+rsiValue = ta.rsi(i_src, i_rsiLength)
+
+// ─── Entry Conditions ───
+longCondition  = i_src <= bbLower and rsiValue < i_rsiOS
+shortCondition = i_src >= bbUpper and rsiValue > i_rsiOB and i_useShorts
+
+// ─── Exit Conditions ───
+longExit  = i_src >= bbBasis
+shortExit = i_src <= bbBasis
+
+// ─── Position Sizing ───
+qty = math.floor((strategy.equity * i_posSize / 100.0) / close)
+
+// ─── Strategy Execution ───
+if longCondition and strategy.position_size <= 0
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Close Short → Long")
+    strategy.entry("Long", strategy.long, qty=qty, comment="BB Lower + RSI OS")
+
+if shortCondition and strategy.position_size >= 0
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Close Long → Short")
+    strategy.entry("Short", strategy.short, qty=qty, comment="BB Upper + RSI OB")
+
+// ─── Exits at Mean ───
+if strategy.position_size > 0 and longExit
+    strategy.close("Long", comment="Exit at Mean")
+
+if strategy.position_size < 0 and shortExit
+    strategy.close("Short", comment="Exit at Mean")
+
+// ─── Plots ───
+pBasis = plot(bbBasis, "BB Basis (SMA)", color=color.new(color.yellow, 0), linewidth=2)
+pUpper = plot(bbUpper, "BB Upper", color=color.new(color.red, 20), linewidth=1)
+pLower = plot(bbLower, "BB Lower", color=color.new(color.green, 20), linewidth=1)
+fill(pUpper, pBasis, color=color.new(color.red, 90), title="Upper Band Fill")
+fill(pBasis, pLower, color=color.new(color.green, 90), title="Lower Band Fill")
+
+// ─── Entry / Exit Markers ───
+plotshape(longCondition and strategy.position_size <= 0, title="Long Entry",
+          style=shape.triangleup, location=location.belowbar,
+          color=color.green, size=size.small, text="Long")
+
+plotshape(shortCondition and strategy.position_size >= 0, title="Short Entry",
+          style=shape.triangledown, location=location.abovebar,
+          color=color.red, size=size.small, text="Short")
+
+plotshape(strategy.position_size > 0 and longExit, title="Long Exit",
+          style=shape.xcross, location=location.abovebar,
+          color=color.orange, size=size.tiny, text="Exit")
+
+plotshape(strategy.position_size < 0 and shortExit, title="Short Exit",
+          style=shape.xcross, location=location.belowbar,
+          color=color.orange, size=size.tiny, text="Exit")
+
+// ─── Background Color for Position ───
+bgColor = strategy.position_size > 0 ? color.new(color.green, 92) :
+          strategy.position_size < 0 ? color.new(color.red, 92) : na
+bgcolor(bgColor, title="Position Background")
+
+// ─── Info Table ───
+var table infoTable = table.new(position.top_right, 2, 4, bgcolor=color.new(color.black, 80),
+                                 border_width=1, border_color=color.gray)
+
+if barstate.islast
+    table.cell(infoTable, 0, 0, "Metric", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 0, "Value", text_color=color.white, text_size=size.small)
+
+    table.cell(infoTable, 0, 1, "RSI", text_color=color.white, text_size=size.small)
+    rsiColor = rsiValue > i_rsiOB ? color.red : rsiValue < i_rsiOS ? color.green : color.gray
+    table.cell(infoTable, 1, 1, str.tostring(rsiValue, "#.##"), text_color=rsiColor, text_size=size.small)
+
+    table.cell(infoTable, 0, 2, "BB Width %", text_color=color.white, text_size=size.small)
+    table.cell(infoTable, 1, 2, str.tostring(bbWidth, "#.##"), text_color=color.aqua, text_size=size.small)
+
+    table.cell(infoTable, 0, 3, "Position", text_color=color.white, text_size=size.small)
+    posText = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    posColor = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    table.cell(infoTable, 1, 3, posText, text_color=posColor, text_size=size.small)
+
+// ─── Alerts ───
+alertcondition(longCondition, title="Long Entry Signal", message="Mean Reversion: Long at BB Lower + RSI OS on {{ticker}}")
+alertcondition(shortCondition, title="Short Entry Signal", message="Mean Reversion: Short at BB Upper + RSI OB on {{ticker}}")
