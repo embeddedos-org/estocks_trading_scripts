@@ -367,6 +367,17 @@ This project is for personal/educational use. Trading involves risk — scripts 
 | **DCA Bot** | `interactive_brokers/strategies/dca_bot.py` | Dollar Cost Averaging with regime-aware pausing. Skips buys when RSI > 75 or death cross. Tracks cost basis. |
 | **Risk Manager** | `shared/risk_manager.py` | Standalone risk module: position sizing (fixed fractional / Kelly), daily loss limits, cooldown after losses, drawdown circuit breaker, portfolio heat. |
 
+### 🧠 Self-Learning AI Agent (Python)
+| Component | File | Description |
+|---|---|---|
+| **Self-Learning Agent** | `shared/ml/self_learning_agent.py` | Autonomous orchestrator: classifies regime → queries trade memory → runs ensemble prediction → applies risk management → decides BUY/SELL/HOLD → records outcome → detects model degradation → triggers retraining. |
+| **Ensemble Predictor** | `shared/ml/ensemble_predictor.py` | Combines LSTM, Transformer, RL, and momentum signals with adaptive weights. Models that perform better get more influence. Regime-conditional weighting. |
+| **Trade Memory** | `shared/ml/trade_memory.py` | SQLite-backed persistent journal storing every trade with full context: features, regime, model predictions, P&L. Enables "what worked in similar conditions?" queries. |
+| **Regime Classifier** | `shared/ml/regime_classifier.py` | LightGBM classifier (30+ features) auto-labeling TRENDING/RANGING/VOLATILE regimes. |
+| **LSTM Predictor** | `shared/ml/deep_learning/lstm_predictor.py` | PyTorch LSTM/GRU for next-day return prediction. Walk-forward backtesting. |
+| **Transformer Predictor** | `shared/ml/deep_learning/transformer_predictor.py` | Attention-based time series predictor. Positional encoding + self-attention. |
+| **RL Trading Agent** | `shared/ml/rl_agent.py` | PPO/A2C/SAC via Stable-Baselines3. Custom Gymnasium environment with configurable reward (PnL/Sharpe/Sortino). |
+
 ---
 
 ### Strategy Quick-Reference Guide
@@ -444,4 +455,49 @@ bot.run("AAPL", interval_seconds=300)
 - Drawdown circuit breaker (24h pause at 10% drawdown)
 - Portfolio heat limit (max 20% of capital at risk)
 - Trade frequency throttle (max 10/hour)
+</details>
+
+<details>
+<summary><strong>🧠 Self-Learning AI Agent</strong> — How it works</summary>
+
+The self-learning agent is the most advanced component in stocks_plugin. It combines all ML models into an autonomous decision-making loop that improves over time.
+
+**Decision Loop (every bar):**
+1. **Classify Regime** — LightGBM predicts TRENDING/RANGING/VOLATILE from 30+ features
+2. **Query Memory** — "In similar TRENDING conditions, what worked? Which model was most accurate?"
+3. **Gather Predictions** — LSTM, Transformer, RL, and momentum each produce a signal
+4. **Ensemble Vote** — Weighted combination with adaptive weights (accurate models get more influence)
+5. **Risk Gate** — Daily loss limit, drawdown circuit breaker, cooldown checks
+6. **Execute** — BUY, SELL, or HOLD
+7. **Record** — Full context (features, predictions, regime, P&L) saved to SQLite
+8. **Self-Evaluate** — Detect model degradation, recommend retraining
+
+**Self-Improvement Mechanisms:**
+- Adaptive ensemble weights update every 20 decisions based on per-model accuracy
+- Regime-conditional weighting: e.g., momentum gets amplified in trends, suppressed in volatility
+- Confidence calibration: historical win rate adjusts confidence thresholds per regime
+- Model degradation detection: accuracy below 45% or declining trend triggers retrain alert
+
+**Quick Start:**
+```python
+from shared.ml.self_learning_agent import SelfLearningAgent
+
+agent = SelfLearningAgent()
+agent.train(df_historical)                    # train all models
+decision = agent.decide(df_current, "AAPL")   # autonomous decision
+print(decision["action"], decision["confidence"], decision["reasoning"])
+
+# After trade completes:
+agent.record_outcome(exit_price=155, pnl=500)
+
+# Check what the agent has learned:
+print(agent.get_performance(lookback_days=30))
+print(agent.get_weight_summary())
+```
+
+**Via CLI:**
+```bash
+python -m strategies.runner backtest --strategy self_learning --data synthetic
+python -m strategies.runner backtest --strategy self_learning --data SPY.csv --params models=regime,lstm
+```
 </details>

@@ -36,6 +36,17 @@ scipy>=1.11
 # Optional: TA-Lib (requires system install: conda install -c conda-forge ta-lib)
 # TA-Lib>=0.4.28
 
+# Optional: Public market data (free, no API key required)
+yfinance>=0.2
+feedparser>=6.0
+
+# Optional: News sentiment analysis
+vaderSentiment>=3.3
+
+# Optional: Advanced NLP sentiment (FinBERT)
+# transformers>=4.30
+# sentencepiece>=0.1
+
 # Optional: Backtrader
 backtrader>=1.9
 

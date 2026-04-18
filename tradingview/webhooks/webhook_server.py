@@ -577,6 +577,142 @@ def create_app(config_path: str = None) -> FastAPI:
             },
         )
 
+    # ─── AI-Enhanced Webhook Endpoint ───
+    @app.post("/ai-webhook")
+    async def receive_ai_webhook(request: Request):
+        """
+        AI-enhanced TradingView webhook.
+
+        Routes alerts through the SelfLearningAgent before executing.
+        The agent can confirm, override, or block the Pine Script signal
+        based on ML analysis, news sentiment, and trade history.
+
+        Flow: TradingView Alert → AI Agent.decide() → Broker Execution
+        """
+        client_ip = request.client.host if request.client else "unknown"
+        security_config = config.get("security", {})
+
+        # ── Rate Limiting ──
+        if config.get("rate_limiting", {}).get("enabled", True):
+            if not app.state.rate_limiter.is_allowed(client_ip):
+                raise HTTPException(status_code=429, detail="Rate limit exceeded")
+
+        # ── Parse Payload ──
+        raw_body = await request.body()
+        try:
+            import json
+            payload_dict = json.loads(raw_body)
+            alert = AlertPayload(**payload_dict)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Invalid payload: {str(e)}")
+
+        # ── Fetch Data for AI Agent ──
+        ai_result = {"agent_used": False, "agent_action": None, "confidence": 0}
+
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+            from shared.data.public_data_fetcher import PublicDataFetcher
+            from shared.ml.self_learning_agent import SelfLearningAgent, AgentConfig
+
+            # Initialize agent (lazy singleton)
+            if not hasattr(app.state, "ai_agent") or app.state.ai_agent is None:
+                import tempfile
+                db_path = os.path.join(tempfile.gettempdir(), "webhook_agent_memory.db")
+                app.state.ai_agent = SelfLearningAgent(AgentConfig(db_path=db_path))
+
+            # Fetch market data
+            fetcher = PublicDataFetcher(cache_enabled=True)
+            df = fetcher.fetch_ohlcv(alert.symbol, period="6mo", interval="1d")
+
+            if df is not None and len(df) >= 60:
+                decision = app.state.ai_agent.decide(df, symbol=alert.symbol)
+                ai_action = decision.get("action", "HOLD")
+                ai_confidence = decision.get("confidence", 0)
+                ai_regime = decision.get("regime", "UNKNOWN")
+
+                ai_result = {
+                    "agent_used": True,
+                    "agent_action": ai_action,
+                    "confidence": ai_confidence,
+                    "regime": ai_regime,
+                    "tv_action": alert.action,
+                    "agreement": ai_action.lower() == alert.action.lower(),
+                }
+
+                # AI can override: if agent strongly disagrees, block the trade
+                if not ai_result["agreement"] and ai_confidence > 0.7:
+                    logger.warning(
+                        "AI OVERRIDE: TradingView says %s but agent says %s (confidence=%.2f). BLOCKING.",
+                        alert.action, ai_action, ai_confidence,
+                    )
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "status": "blocked_by_ai",
+                            "tv_action": alert.action,
+                            "ai_action": ai_action,
+                            "ai_confidence": ai_confidence,
+                            "ai_regime": ai_regime,
+                            "reason": "AI agent strongly disagrees with TradingView signal",
+                        },
+                    )
+
+        except Exception as e:
+            logger.warning("AI agent processing failed (executing TV signal anyway): %s", e)
+
+        # ── Route to Broker (real execution) ──
+        try:
+            broker = app.state.broker_router.get_broker(alert.symbol)
+            quantity = alert.quantity or 1.0
+
+            order_result = broker.place_order(
+                symbol=alert.symbol,
+                action=alert.action.lower(),
+                quantity=quantity,
+                order_type=alert.order_type,
+                price=alert.price,
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Broker execution failed: {str(e)}")
+
+        app.state.last_alert_time = datetime.now(timezone.utc)
+        app.state.total_alerts += 1
+
+        # ── Notifications ──
+        if app.state.alert_dispatcher:
+            try:
+                ai_note = ""
+                if ai_result["agent_used"]:
+                    ai_note = f"\nAI: {ai_result['agent_action']} (conf={ai_result['confidence']:.0%})"
+                app.state.alert_dispatcher.dispatch(
+                    title=f"AI Trade: {alert.action.upper()} {alert.symbol}",
+                    message=(
+                        f"TV Signal: {alert.action} {alert.symbol} @ {alert.price}"
+                        f"{ai_note}\nBroker: {broker.name} → {order_result.order_id}"
+                    ),
+                    level="info",
+                )
+            except Exception:
+                pass
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "status": "success",
+                "alert": {
+                    "symbol": alert.symbol,
+                    "action": alert.action,
+                    "price": alert.price,
+                    "quantity": quantity,
+                },
+                "ai": ai_result,
+                "order": order_result.model_dump(),
+                "processed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
     # ─── Status Endpoint ──
     @app.get("/status")
     async def server_status():

@@ -31,6 +31,7 @@ import strategies.examples.mean_reversion  # noqa: F401
 import strategies.examples.breakout  # noqa: F401
 import strategies.examples.factor_portfolio  # noqa: F401
 import strategies.examples.ml_rl_strategy  # noqa: F401
+import strategies.examples.self_learning_strategy  # noqa: F401
 
 from strategies import STRATEGY_REGISTRY, list_strategies
 from shared.backtesting.backtest_engine_v2 import BacktestEngineV2, BacktestResultV2
@@ -208,7 +209,7 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         return
 
     # Handle ML/RL strategies (need training)
-    if strategy_name in ("ml", "rl"):
+    if strategy_name in ("ml", "rl", "self_learning"):
         params = _parse_params(args.params) if args.params else {}
         strategy_cls = STRATEGY_REGISTRY[strategy_name]
         strategy = strategy_cls.from_params(params) if params else strategy_cls()
