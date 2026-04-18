@@ -113,13 +113,45 @@ class IBAdapter(BaseBrokerAdapter):
         self._data_fetcher = None
         self._connected = False
         self._name = "interactive_brokers"
+        self._event_loop = None
+        self._loop_thread = None
 
     @property
     def name(self) -> str:
         return self._name
 
+    def _ensure_event_loop(self) -> None:
+        """Start a dedicated asyncio event loop in a background daemon thread.
+
+        ib_async requires a running event loop for all operations. BrokerBridge
+        is synchronous, so we spin up a dedicated loop thread and submit
+        coroutines to it via run_coroutine_threadsafe().
+        """
+        import asyncio
+        import threading
+
+        if self._event_loop is not None and self._event_loop.is_running():
+            return
+
+        self._event_loop = asyncio.new_event_loop()
+
+        def _run() -> None:
+            asyncio.set_event_loop(self._event_loop)
+            self._event_loop.run_forever()
+
+        self._loop_thread = threading.Thread(target=_run, daemon=True, name="ib-async-loop")
+        self._loop_thread.start()
+
+    def _run_async(self, coro, timeout: float = 30.0):
+        """Run an async coroutine on the IB event loop from synchronous code."""
+        import asyncio
+        self._ensure_event_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, self._event_loop)
+        return future.result(timeout=timeout)
+
     def connect(self) -> bool:
         try:
+            import inspect
             from interactive_brokers.utils.ib_connection import IBConnection
             from interactive_brokers.utils.order_manager import OrderManager
 
@@ -129,7 +161,15 @@ class IBAdapter(BaseBrokerAdapter):
                 port=self._port,
                 client_id=self._client_id,
             )
-            self._connection.connect()
+
+            # IBAsyncConnection.connect() is a coroutine — bridge to sync via
+            # a dedicated background event loop so the IB message loop keeps
+            # running after the initial handshake.
+            if inspect.iscoroutinefunction(self._connection.connect):
+                self._run_async(self._connection.connect(), timeout=30.0)
+            else:
+                self._connection.connect()
+
             self._order_manager = OrderManager(self._connection)
 
             try:
@@ -151,6 +191,8 @@ class IBAdapter(BaseBrokerAdapter):
             self._connection.disconnect()
             self._connected = False
             logger.info("IB disconnected")
+        if self._event_loop and self._event_loop.is_running():
+            self._event_loop.call_soon_threadsafe(self._event_loop.stop)
 
     def is_connected(self) -> bool:
         if self._connection:
@@ -326,7 +368,20 @@ class TradeStationAdapter(BaseBrokerAdapter):
             return {"broker": self.name, "connected": True}
 
     def get_latest_price(self, symbol: str) -> float:
-        return 0.0  # TradeStation REST API doesn't have a simple quote endpoint in v3
+        if not self._router:
+            return 0.0
+        try:
+            quote = self._router.get_quote(symbol)
+            # TradeStation v3 quote fields: Last, Ask, Bid, Close
+            for field in ("Last", "Ask", "Bid", "Close"):
+                val = quote.get(field)
+                if val is not None:
+                    price = float(val)
+                    if price > 0:
+                        return price
+        except Exception as e:
+            logger.warning("TradeStation get_latest_price(%s) failed: %s", symbol, e)
+        return 0.0
 
 
 # ─── Schwab/thinkorswim Adapter ───

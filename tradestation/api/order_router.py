@@ -308,3 +308,41 @@ class TradeStationOrderRouter:
             "GET", f"/brokerage/accounts/{account_id}/orders"
         )
         return result.get("Orders", [])
+
+    def get_quote(self, symbol: str) -> dict:
+        """Get a real-time quote for a symbol using the MarketData v3 API.
+
+        Args:
+            symbol: Ticker symbol (e.g. "AAPL").
+
+        Returns:
+            Dict with at least a "Last" key (last trade price as float),
+            or an empty dict on failure.
+        """
+        try:
+            result = self._request("GET", f"/marketdata/quotes/{symbol}")
+            quotes = result.get("Quotes", [])
+            if quotes:
+                return quotes[0]
+        except TradeStationAPIError as e:
+            logger.warning("get_quote(%s) failed: %s", symbol, e)
+        return {}
+
+    def get_quotes(self, symbols: list) -> list:
+        """Get real-time quotes for multiple symbols.
+
+        Args:
+            symbols: List of ticker symbols.
+
+        Returns:
+            List of quote dicts.
+        """
+        if not symbols:
+            return []
+        joined = ",".join(symbols)
+        try:
+            result = self._request("GET", f"/marketdata/quotes/{joined}")
+            return result.get("Quotes", [])
+        except TradeStationAPIError as e:
+            logger.warning("get_quotes(%s) failed: %s", joined, e)
+        return []

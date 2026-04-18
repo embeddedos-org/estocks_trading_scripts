@@ -36,6 +36,7 @@ Thumbs.db
 coverage.xml
 htmlcov/
 
-# Data files
-data/
+# Data files (top-level only — shared/data/ contains source code)
+/data/
 *.csv
+!shared/data/

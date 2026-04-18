@@ -179,25 +179,40 @@ class BrokerAdapter(ABC):
 
 
 class IBBrokerAdapter(BrokerAdapter):
-    """Interactive Brokers adapter (placeholder implementation)."""
+    """Interactive Brokers adapter — delegates to the real IBAdapter from broker_bridge."""
 
     def __init__(self, config: dict = None):
         self._config = config or {}
-        self._connected = False
-        self._order_counter = 0
+        self._adapter = None
+        self._init_adapter()
+
+    def _init_adapter(self) -> None:
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+            from shared.daemon.broker_bridge import IBAdapter
+            self._adapter = IBAdapter(
+                host=self._config.get("host", "127.0.0.1"),
+                port=self._config.get("port", 7497),
+                client_id=self._config.get("client_id", 1),
+            )
+        except Exception as e:
+            logger.warning("IBBrokerAdapter init failed: %s", e)
 
     @property
     def name(self) -> str:
         return "interactive_brokers"
 
     def connect(self) -> bool:
-        logger.info("Connecting to Interactive Brokers...")
-        self._connected = True
-        return True
+        if self._adapter is None:
+            self._init_adapter()
+        if self._adapter:
+            return self._adapter.connect()
+        return False
 
     def disconnect(self) -> None:
-        logger.info("Disconnecting from Interactive Brokers")
-        self._connected = False
+        if self._adapter:
+            self._adapter.disconnect()
 
     def place_order(
         self,
@@ -207,52 +222,79 @@ class IBBrokerAdapter(BrokerAdapter):
         order_type: str,
         price: float,
     ) -> OrderResult:
-        if not self._connected:
-            self.connect()
+        if self._adapter is None:
+            return OrderResult(
+                success=False, broker=self.name, order_id=None,
+                message="IBAdapter not initialised",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+        if not self._adapter.is_connected():
+            if not self._adapter.connect():
+                return OrderResult(
+                    success=False, broker=self.name, order_id=None,
+                    message="Could not connect to IB Gateway",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+        try:
+            if order_type == "limit" and price > 0:
+                result = self._adapter.place_limit_order(symbol, action.upper(), int(quantity), price)
+            else:
+                result = self._adapter.place_market_order(symbol, action.upper(), int(quantity))
 
-        self._order_counter += 1
-        order_id = f"IB-{self._order_counter:06d}"
-        logger.info(
-            f"[IB] Order {order_id}: {action} {quantity} {symbol} @ {price} ({order_type})"
-        )
-
-        return OrderResult(
-            success=True,
-            broker=self.name,
-            order_id=order_id,
-            message=f"Order placed: {action} {quantity} {symbol} @ {price}",
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
+            return OrderResult(
+                success=result.success,
+                broker=self.name,
+                order_id=result.order_id or None,
+                message=result.message,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as e:
+            logger.error("IB place_order error: %s", e)
+            return OrderResult(
+                success=False, broker=self.name, order_id=None, message=str(e),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
 
     def get_account_info(self) -> dict:
-        return {
-            "broker": self.name,
-            "connected": self._connected,
-            "account_type": "paper",
-            "buying_power": 100000.0,
-        }
+        if self._adapter and self._adapter.is_connected():
+            return self._adapter.get_account_info()
+        return {"broker": self.name, "connected": False}
 
 
 class TradeStationBrokerAdapter(BrokerAdapter):
-    """TradeStation adapter (placeholder implementation)."""
+    """TradeStation adapter — delegates to the real TradeStationAdapter from broker_bridge."""
 
     def __init__(self, config: dict = None):
         self._config = config or {}
-        self._connected = False
-        self._order_counter = 0
+        self._adapter = None
+        self._init_adapter()
+
+    def _init_adapter(self) -> None:
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+            from shared.daemon.broker_bridge import TradeStationAdapter
+            self._adapter = TradeStationAdapter(
+                self._config,
+                self._config.get("account_id", ""),
+            )
+        except Exception as e:
+            logger.warning("TradeStationBrokerAdapter init failed: %s", e)
 
     @property
     def name(self) -> str:
         return "tradestation"
 
     def connect(self) -> bool:
-        logger.info("Connecting to TradeStation...")
-        self._connected = True
-        return True
+        if self._adapter is None:
+            self._init_adapter()
+        if self._adapter:
+            return self._adapter.connect()
+        return False
 
     def disconnect(self) -> None:
-        logger.info("Disconnecting from TradeStation")
-        self._connected = False
+        if self._adapter:
+            self._adapter.disconnect()
 
     def place_order(
         self,
@@ -262,29 +304,122 @@ class TradeStationBrokerAdapter(BrokerAdapter):
         order_type: str,
         price: float,
     ) -> OrderResult:
-        if not self._connected:
-            self.connect()
+        if self._adapter is None:
+            return OrderResult(
+                success=False, broker=self.name, order_id=None,
+                message="TradeStationAdapter not initialised",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+        if not self._adapter.is_connected():
+            if not self._adapter.connect():
+                return OrderResult(
+                    success=False, broker=self.name, order_id=None,
+                    message="Could not connect to TradeStation",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+        try:
+            if order_type == "limit" and price > 0:
+                result = self._adapter.place_limit_order(symbol, action.upper(), int(quantity), price)
+            else:
+                result = self._adapter.place_market_order(symbol, action.upper(), int(quantity))
 
-        self._order_counter += 1
-        order_id = f"TS-{self._order_counter:06d}"
-        logger.info(
-            f"[TS] Order {order_id}: {action} {quantity} {symbol} @ {price} ({order_type})"
-        )
-
-        return OrderResult(
-            success=True,
-            broker=self.name,
-            order_id=order_id,
-            message=f"Order placed: {action} {quantity} {symbol} @ {price}",
-            timestamp=datetime.now(timezone.utc).isoformat(),
-        )
+            return OrderResult(
+                success=result.success,
+                broker=self.name,
+                order_id=result.order_id or None,
+                message=result.message,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as e:
+            logger.error("TradeStation place_order error: %s", e)
+            return OrderResult(
+                success=False, broker=self.name, order_id=None, message=str(e),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
 
     def get_account_info(self) -> dict:
-        return {
-            "broker": self.name,
-            "connected": self._connected,
-            "account_type": "paper",
-        }
+        if self._adapter:
+            return self._adapter.get_account_info()
+        return {"broker": self.name, "connected": False}
+
+
+class SchwabBrokerAdapter(BrokerAdapter):
+    """Schwab/thinkorswim adapter — delegates to the real SchwabAdapter from broker_bridge."""
+
+    def __init__(self, config: dict = None):
+        self._config = config or {}
+        self._adapter = None
+        self._init_adapter()
+
+    def _init_adapter(self) -> None:
+        try:
+            import sys, os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+            from shared.daemon.broker_bridge import SchwabAdapter
+            self._adapter = SchwabAdapter(self._config)
+        except Exception as e:
+            logger.warning("SchwabBrokerAdapter init failed: %s", e)
+
+    @property
+    def name(self) -> str:
+        return "schwab"
+
+    def connect(self) -> bool:
+        if self._adapter is None:
+            self._init_adapter()
+        if self._adapter:
+            return self._adapter.connect()
+        return False
+
+    def disconnect(self) -> None:
+        if self._adapter:
+            self._adapter.disconnect()
+
+    def place_order(
+        self,
+        symbol: str,
+        action: str,
+        quantity: float,
+        order_type: str,
+        price: float,
+    ) -> OrderResult:
+        if self._adapter is None:
+            return OrderResult(
+                success=False, broker=self.name, order_id=None,
+                message="SchwabAdapter not initialised",
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+        if not self._adapter.is_connected():
+            if not self._adapter.connect():
+                return OrderResult(
+                    success=False, broker=self.name, order_id=None,
+                    message="Could not connect to Schwab",
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+        try:
+            if order_type == "limit" and price > 0:
+                result = self._adapter.place_limit_order(symbol, action.upper(), int(quantity), price)
+            else:
+                result = self._adapter.place_market_order(symbol, action.upper(), int(quantity))
+
+            return OrderResult(
+                success=result.success,
+                broker=self.name,
+                order_id=result.order_id or None,
+                message=result.message,
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+        except Exception as e:
+            logger.error("Schwab place_order error: %s", e)
+            return OrderResult(
+                success=False, broker=self.name, order_id=None, message=str(e),
+                timestamp=datetime.now(timezone.utc).isoformat(),
+            )
+
+    def get_account_info(self) -> dict:
+        if self._adapter:
+            return self._adapter.get_account_info()
+        return {"broker": self.name, "connected": False}
 
 
 # ─── Rate Limiter ───
@@ -328,9 +463,12 @@ class BrokerRouter:
         self._default = config.get("broker_routing", {}).get(
             "default_broker", "interactive_brokers"
         )
+        broker_configs = config.get("broker_configs", {})
         self._adapters: dict[str, BrokerAdapter] = {
-            "interactive_brokers": IBBrokerAdapter(),
-            "tradestation": TradeStationBrokerAdapter(),
+            "interactive_brokers": IBBrokerAdapter(broker_configs.get("interactive_brokers", {})),
+            "tradestation": TradeStationBrokerAdapter(broker_configs.get("tradestation", {})),
+            "schwab": SchwabBrokerAdapter(broker_configs.get("schwab", {})),
+            "thinkorswim": SchwabBrokerAdapter(broker_configs.get("schwab", {})),
         }
 
     def get_broker(self, symbol: str) -> BrokerAdapter:
