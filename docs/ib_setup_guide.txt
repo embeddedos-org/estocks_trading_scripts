@@ -1,0 +1,49 @@
+# IB Gateway Setup Guide for Self-Learning Trading Agent
+# ========================================================
+#
+# STEP 1: Create IB Account
+#   - Go to https://www.interactivebrokers.com
+#   - Open a paper trading account (free, no deposit required)
+#   - Note your username and password
+#
+# STEP 2: Download IB Gateway
+#   - Download from: https://www.interactivebrokers.com/en/trading/ibgateway-stable.php
+#   - Or TWS: https://www.interactivebrokers.com/en/trading/tws-updateable-latest.php
+#   - Install and login with paper trading credentials
+#
+# STEP 3: Configure API Access
+#   In IB Gateway/TWS:
+#   - File → Global Configuration → API → Settings
+#   - ✅ Enable ActiveX and Socket Clients
+#   - ✅ Allow connections from localhost only (or your IP)
+#   - Port: 7497 (paper) or 7496 (live)
+#   - ❌ Read-Only API = UNCHECKED (need write access for orders)
+#   - ✅ Download open orders on connection
+#   - Master API client ID: leave blank (or set to 0)
+#
+# STEP 4: Set Trusted IP
+#   - In API Precautions:
+#   - ✅ Bypass Order Precautions for API Orders
+#
+# STEP 5: Start the Agent
+#   Run one of the launcher scripts below:
+#
+#   Paper simulation (no IB needed):
+#     python launch_paper_sim.py
+#
+#   IB paper trading (IB Gateway must be running):
+#     python launch_ib_paper.py
+#
+#   Monitor mode (no trades, just log decisions):
+#     python launch_monitor.py
+#
+# CONNECTION PORTS:
+#   7497 = TWS Paper Trading
+#   7496 = TWS Live Trading
+#   4002 = IB Gateway Paper Trading
+#   4001 = IB Gateway Live Trading
+#
+# TROUBLESHOOTING:
+#   - "Connection refused": IB Gateway/TWS not running or API not enabled
+#   - "Max number of TWS clients reached": reduce client_id or close other clients
+#   - "Not connected": check firewall rules

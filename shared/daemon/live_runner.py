@@ -447,9 +447,9 @@ class LiveRunner:
 
         # Use the first symbol's data for training
         primary_symbol = self._symbols[0]
-        logger.info("Fetching 1 year of %s data for training...", primary_symbol)
+        logger.info("Fetching 2 years of %s data for training...", primary_symbol)
 
-        df = self._data_fetcher.fetch_ohlcv(primary_symbol, period="1y", interval="1d")
+        df = self._data_fetcher.fetch_ohlcv(primary_symbol, period="2y", interval="1d")
         if df is None or df.empty:
             logger.warning("Could not fetch training data for %s. Using untrained agent.", primary_symbol)
             return
