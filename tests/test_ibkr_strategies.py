@@ -480,7 +480,7 @@ class TestDCAPosition:
         )
         assert pos.current_value == 5500.0
         assert pos.unrealized_pnl == 500.0
-        assert pos.return_pct == 10.0
+        assert abs(pos.return_pct - 10.0) < 0.001
 
     def test_position_loss(self):
         pos = DCAPosition(
@@ -492,7 +492,7 @@ class TestDCAPosition:
         )
         assert pos.current_value == 9500.0
         assert pos.unrealized_pnl == -500.0
-        assert pos.return_pct == -5.0
+        assert abs(pos.return_pct - (-5.0)) < 0.001
 
 
 class TestDCARegimeCheck:

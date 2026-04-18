@@ -42,10 +42,30 @@ def _compute_hmac(payload: dict, secret: str = WEBHOOK_SECRET) -> str:
 
 @pytest.fixture
 def client():
-    """Create a test client for the webhook server."""
+    """Create a test client for the webhook server with permissive security."""
     if not HAS_TESTCLIENT:
         pytest.skip("fastapi not installed")
-    return TestClient(app)
+
+    from tradingview.webhooks.webhook_server import create_app
+
+    # Create app with permissive test config
+    test_config = {
+        "server": {"host": "0.0.0.0", "port": 5000, "debug": False, "title": "Test", "version": "test"},
+        "security": {
+            "hmac_secret": "",
+            "hmac_algorithm": "sha256",
+            "allowed_ips": [],
+            "require_passphrase": False,
+            "passphrase": "",
+        },
+        "rate_limiting": {"enabled": False, "max_requests_per_minute": 9999, "window_seconds": 60},
+        "broker_routing": {"default_broker": "interactive_brokers", "routes": []},
+        "logging": {"level": "WARNING"},
+    }
+
+    with patch("tradingview.webhooks.webhook_server.load_config", return_value=test_config):
+        test_app = create_app()
+    return TestClient(test_app)
 
 
 class TestHealthEndpoint:

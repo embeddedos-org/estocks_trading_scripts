@@ -28,8 +28,11 @@ class TestIBConnectionFactory:
 
     def test_create_ibapi_backend(self):
         from interactive_brokers.utils.ib_connection import IBConnection
-        conn = IBConnection.create(backend="ibapi", port=7497)
-        assert conn is not None
+        try:
+            conn = IBConnection.create(backend="ibapi", port=7497)
+            assert conn is not None
+        except ImportError:
+            pytest.skip("ibapi not installed")
 
     def test_create_invalid_backend_raises(self):
         from interactive_brokers.utils.ib_connection import IBConnection
@@ -74,8 +77,11 @@ class TestIBConnectionInterface:
 
     def test_not_connected_initially(self):
         from interactive_brokers.utils.ib_connection import IBConnection
-        conn = IBConnection.create(port=7497)
-        assert conn.is_connected is False
+        try:
+            conn = IBConnection.create(port=7497)
+            assert conn.is_connected() is False
+        except ImportError:
+            pytest.skip("ib_async not installed")
 
 
 class TestIBConnectionContextManager:
