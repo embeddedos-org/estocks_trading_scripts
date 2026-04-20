@@ -339,9 +339,7 @@ class BacktestEngineV2:
                 if target_signal != 0 and current_pos == 0:
                     if target_signal == 1:  # go long
                         buy_price = price + slip
-                        shares = int(capital * 0.95 / buy_price) if buy_price > 0 else 0
-                        if len(positions) > 0:
-                            shares = int((capital * 0.95 / len(self._data)) / buy_price) if buy_price > 0 else 0
+                        shares = int((capital * 0.95 / len(self._data)) / buy_price) if buy_price > 0 else 0
                         if shares > 0:
                             cost = shares * buy_price
                             comm = cost * self.commission
@@ -364,9 +362,7 @@ class BacktestEngineV2:
 
                     elif target_signal == -1:  # go short
                         sell_price = price - slip
-                        shares = int(capital * 0.95 / sell_price) if sell_price > 0 else 0
-                        if len(positions) > 0:
-                            shares = int((capital * 0.95 / len(self._data)) / sell_price) if sell_price > 0 else 0
+                        shares = int((capital * 0.95 / len(self._data)) / sell_price) if sell_price > 0 else 0
                         if shares > 0:
                             proceeds = shares * sell_price
                             comm = proceeds * self.commission
@@ -427,7 +423,8 @@ class BacktestEngineV2:
 
         # CAGR
         n_years = len(equity_curve) / self.ANNUALIZATION_FACTOR
-        cagr = (equity_curve[-1] / self.initial_capital) ** (1.0 / n_years) - 1 if n_years > 0 else 0
+        final_ratio = max(0.0001, equity_curve[-1] / self.initial_capital)
+        cagr = final_ratio ** (1.0 / n_years) - 1 if n_years > 0 else 0
 
         # Sharpe
         mean_ret = float(np.mean(returns))

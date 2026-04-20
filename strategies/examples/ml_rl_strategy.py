@@ -61,6 +61,8 @@ class MLConfig:
     epochs: int = 20
     hidden_size: int = 64
     threshold: float = 0.0
+    prediction_threshold: float = 0.005
+    trailing_stop_pct: float = 0.05  # 5% trailing stop
 
 
 @register_strategy("ml")
@@ -77,6 +79,8 @@ class MLStrategy:
         self._predictor = None
         self._feature_engineer = None
         self._fallback = not _HAS_TORCH
+        self._entry_prices: Dict[str, float] = {}
+        self._peak_prices: Dict[str, float] = {}
 
         if _HAS_TORCH:
             try:
@@ -113,17 +117,40 @@ class MLStrategy:
         target = target.loc[valid]
 
         print(f"  [ML] Training LSTM on {len(features)} samples...")
-        self._predictor.train(df.loc[valid])
+        self._predictor.train(features, target)
         print("  [ML] Training complete.")
 
     def generate_signals(self, ctx: BacktestContext) -> Dict[str, int]:
         """Generate signals using LSTM predictions or momentum fallback."""
         signals: Dict[str, int] = {}
+        threshold = self.config.prediction_threshold
 
         for sym, df in ctx.bars.items():
             if len(df) < 60:
                 signals[sym] = 0
                 continue
+
+            current_price = float(df["close"].iloc[-1])
+            current_pos = ctx.positions.get(sym, 0)
+
+            # Trailing stop check for held positions
+            if current_pos != 0 and sym in self._entry_prices:
+                entry = self._entry_prices[sym]
+                # Update peak price for trailing stop
+                if current_pos > 0:
+                    self._peak_prices[sym] = max(self._peak_prices.get(sym, entry), current_price)
+                    if current_price < self._peak_prices[sym] * (1 - self.config.trailing_stop_pct):
+                        signals[sym] = 0
+                        self._entry_prices.pop(sym, None)
+                        self._peak_prices.pop(sym, None)
+                        continue
+                elif current_pos < 0:
+                    self._peak_prices[sym] = min(self._peak_prices.get(sym, entry), current_price)
+                    if current_price > self._peak_prices[sym] * (1 + self.config.trailing_stop_pct):
+                        signals[sym] = 0
+                        self._entry_prices.pop(sym, None)
+                        self._peak_prices.pop(sym, None)
+                        continue
 
             if self._fallback:
                 close = df["close"]
@@ -132,8 +159,14 @@ class MLStrategy:
                 score = 0.6 * mom_20 + 0.4 * mom_5
                 if score > 0.01:
                     signals[sym] = 1
+                    if current_pos <= 0:
+                        self._entry_prices[sym] = current_price
+                        self._peak_prices[sym] = current_price
                 elif score < -0.01:
                     signals[sym] = -1
+                    if current_pos >= 0:
+                        self._entry_prices[sym] = current_price
+                        self._peak_prices[sym] = current_price
                 else:
                     signals[sym] = 0
             else:
@@ -141,7 +174,18 @@ class MLStrategy:
                     preds = self._predictor.predict(df)
                     if preds is not None and len(preds) > 0:
                         pred = float(preds[-1]) if hasattr(preds, '__len__') else float(preds)
-                        signals[sym] = 1 if pred > self.config.threshold else (-1 if pred < -self.config.threshold else 0)
+                        if pred > threshold:
+                            signals[sym] = 1
+                            if current_pos <= 0:
+                                self._entry_prices[sym] = current_price
+                                self._peak_prices[sym] = current_price
+                        elif pred < -threshold:
+                            signals[sym] = -1
+                            if current_pos >= 0:
+                                self._entry_prices[sym] = current_price
+                                self._peak_prices[sym] = current_price
+                        else:
+                            signals[sym] = 0
                     else:
                         signals[sym] = 0
                 except Exception:
@@ -157,6 +201,7 @@ class RLConfig:
     algorithm: str = "PPO"
     total_timesteps: int = 50_000
     reward_type: str = "pnl"
+    trailing_stop_pct: float = 0.05  # 5% trailing stop
 
 
 @register_strategy("rl")
@@ -171,6 +216,8 @@ class RLStrategy:
         self.config = config or RLConfig()
         self._trader = None
         self._fallback = not _HAS_SB3
+        self._entry_prices: Dict[str, float] = {}
+        self._peak_prices: Dict[str, float] = {}
 
         if _HAS_SB3:
             try:
@@ -205,21 +252,55 @@ class RLStrategy:
                 signals[sym] = 0
                 continue
 
+            current_price = float(df["close"].iloc[-1])
+            current_pos = ctx.positions.get(sym, 0)
+
+            # Trailing stop check for held positions
+            if current_pos != 0 and sym in self._entry_prices:
+                entry = self._entry_prices[sym]
+                if current_pos > 0:
+                    self._peak_prices[sym] = max(self._peak_prices.get(sym, entry), current_price)
+                    if current_price < self._peak_prices[sym] * (1 - self.config.trailing_stop_pct):
+                        signals[sym] = 0
+                        self._entry_prices.pop(sym, None)
+                        self._peak_prices.pop(sym, None)
+                        continue
+                elif current_pos < 0:
+                    self._peak_prices[sym] = min(self._peak_prices.get(sym, entry), current_price)
+                    if current_price > self._peak_prices[sym] * (1 + self.config.trailing_stop_pct):
+                        signals[sym] = 0
+                        self._entry_prices.pop(sym, None)
+                        self._peak_prices.pop(sym, None)
+                        continue
+
             if self._fallback:
                 close = df["close"]
                 rsi = TI.rsi(close, 14)
                 current_rsi = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else 50.0
                 if current_rsi < 35:
                     signals[sym] = 1
+                    if current_pos <= 0:
+                        self._entry_prices[sym] = current_price
+                        self._peak_prices[sym] = current_price
                 elif current_rsi > 65:
                     signals[sym] = -1
+                    if current_pos >= 0:
+                        self._entry_prices[sym] = current_price
+                        self._peak_prices[sym] = current_price
                 else:
                     pos = ctx.positions.get(sym, 0)
                     signals[sym] = 1 if pos > 0 else (-1 if pos < 0 else 0)
             else:
                 try:
                     action = self._trader.predict(df)
-                    signals[sym] = int(action)
+                    sig = int(action)
+                    signals[sym] = sig
+                    if sig == 1 and current_pos <= 0:
+                        self._entry_prices[sym] = current_price
+                        self._peak_prices[sym] = current_price
+                    elif sig == -1 and current_pos >= 0:
+                        self._entry_prices[sym] = current_price
+                        self._peak_prices[sym] = current_price
                 except Exception:
                     signals[sym] = 0
 

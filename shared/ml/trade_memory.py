@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -95,15 +96,20 @@ class TradeMemory:
 
     def __init__(self, db_path: str = "trade_memory.db") -> None:
         self._db_path = db_path
+        self._lock = threading.Lock()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        # FIX 8: SQLite WAL mode for better concurrency
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.row_factory = sqlite3.Row
         self._create_tables()
         logger.info("TradeMemory initialized: %s", db_path)
 
     def _create_tables(self) -> None:
         """Create tables if they don't exist."""
-        self._conn.executescript("""
+        with self._lock:
+            self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
@@ -158,7 +164,7 @@ class TradeMemory:
             CREATE INDEX IF NOT EXISTS idx_model_perf_model ON model_performance(model_name);
             CREATE INDEX IF NOT EXISTS idx_model_perf_regime ON model_performance(regime);
         """)
-        self._conn.commit()
+            self._conn.commit()
 
     # ─── Record Trades ───
 
@@ -171,30 +177,31 @@ class TradeMemory:
         Returns:
             Row ID of the inserted record.
         """
-        cursor = self._conn.execute(
-            """INSERT INTO trades (
-                timestamp, symbol, action, entry_price, exit_price, pnl, pnl_pct,
-                regime, regime_confidence, features_snapshot,
-                lstm_prediction, transformer_prediction, rl_action,
-                regime_prediction, ensemble_signal, ensemble_confidence,
-                decision_source,
-                holding_period_bars, max_favorable_excursion, max_adverse_excursion,
-                is_winner, position_size, risk_amount, portfolio_value_at_entry
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                trade.timestamp, trade.symbol, trade.action,
-                trade.entry_price, trade.exit_price, trade.pnl, trade.pnl_pct,
-                trade.regime, trade.regime_confidence, trade.features_snapshot,
-                trade.lstm_prediction, trade.transformer_prediction, trade.rl_action,
-                trade.regime_prediction, trade.ensemble_signal, trade.ensemble_confidence,
-                trade.decision_source,
-                trade.holding_period_bars, trade.max_favorable_excursion,
-                trade.max_adverse_excursion, int(trade.is_winner),
-                trade.position_size, trade.risk_amount, trade.portfolio_value_at_entry,
-            ),
-        )
-        self._conn.commit()
-        row_id = cursor.lastrowid
+        with self._lock:
+            cursor = self._conn.execute(
+                """INSERT INTO trades (
+                    timestamp, symbol, action, entry_price, exit_price, pnl, pnl_pct,
+                    regime, regime_confidence, features_snapshot,
+                    lstm_prediction, transformer_prediction, rl_action,
+                    regime_prediction, ensemble_signal, ensemble_confidence,
+                    decision_source,
+                    holding_period_bars, max_favorable_excursion, max_adverse_excursion,
+                    is_winner, position_size, risk_amount, portfolio_value_at_entry
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    trade.timestamp, trade.symbol, trade.action,
+                    trade.entry_price, trade.exit_price, trade.pnl, trade.pnl_pct,
+                    trade.regime, trade.regime_confidence, trade.features_snapshot,
+                    trade.lstm_prediction, trade.transformer_prediction, trade.rl_action,
+                    trade.regime_prediction, trade.ensemble_signal, trade.ensemble_confidence,
+                    trade.decision_source,
+                    trade.holding_period_bars, trade.max_favorable_excursion,
+                    trade.max_adverse_excursion, int(trade.is_winner),
+                    trade.position_size, trade.risk_amount, trade.portfolio_value_at_entry,
+                ),
+            )
+            self._conn.commit()
+            row_id = cursor.lastrowid
         logger.info(
             "Trade recorded [#%d]: %s %s @ %.2f → %.2f | P&L: $%.2f (%.2f%%) | regime=%s",
             row_id, trade.action, trade.symbol,
@@ -221,14 +228,15 @@ class TradeMemory:
             symbol: Symbol being predicted.
         """
         is_correct = int(np.sign(prediction) == np.sign(actual_outcome))
-        self._conn.execute(
-            """INSERT INTO model_performance
-               (timestamp, model_name, prediction, actual_outcome, is_correct, regime, symbol)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (datetime.now().isoformat(), model_name, prediction,
-             actual_outcome, is_correct, regime, symbol),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                """INSERT INTO model_performance
+                   (timestamp, model_name, prediction, actual_outcome, is_correct, regime, symbol)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (datetime.now().isoformat(), model_name, prediction,
+                 actual_outcome, is_correct, regime, symbol),
+            )
+            self._conn.commit()
 
     # ─── Query History ───
 
@@ -460,6 +468,26 @@ class TradeMemory:
         return row["cnt"]
 
     # ─── Cleanup ───
+
+    def cleanup_old_trades(self, max_age_days: int = 365, max_records: int = 10000) -> None:
+        """Remove trades older than max_age_days or keep only most recent max_records.
+
+        Args:
+            max_age_days: Delete trades older than this many days.
+            max_records: Cap total records to this number, keeping most recent.
+        """
+        with self._lock:
+            cutoff = (datetime.utcnow() - timedelta(days=max_age_days)).isoformat()
+            self._conn.execute("DELETE FROM trades WHERE timestamp < ?", (cutoff,))
+            # Also cap total records
+            count = self._conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
+            if count > max_records:
+                self._conn.execute(
+                    "DELETE FROM trades WHERE id NOT IN (SELECT id FROM trades ORDER BY id DESC LIMIT ?)",
+                    (max_records,),
+                )
+            self._conn.commit()
+        logger.info("Trade memory cleanup: max_age=%dd, max_records=%d", max_age_days, max_records)
 
     def close(self) -> None:
         """Close database connection."""

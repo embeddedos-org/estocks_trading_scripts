@@ -113,6 +113,7 @@ def mock_ib_adapter():
     adapter.disconnect = lambda: None
     adapter.is_connected = lambda: True
     adapter._name = "interactive_brokers"
+    assert adapter.name == "interactive_brokers"
     return adapter
 
 
@@ -147,6 +148,7 @@ def mock_ts_adapter():
     adapter.disconnect = lambda: None
     adapter.is_connected = lambda: True
     adapter._name = "tradestation"
+    assert adapter.name == "tradestation"
     return adapter
 
 
@@ -180,6 +182,7 @@ def mock_schwab_adapter():
     adapter.disconnect = lambda: None
     adapter.is_connected = lambda: True
     adapter._name = "schwab"
+    assert adapter.name == "schwab"
     return adapter
 
 
@@ -189,7 +192,10 @@ class TestBrokerBridgeAllBrokers:
     """Test BrokerBridge with all 4 broker adapters."""
 
     def _make_bridge(self, adapter, diary_path):
-        from shared.daemon.broker_bridge import BrokerBridge
+        from shared.daemon.broker_bridge import BrokerBridge, CommissionModel
+        from shared.risk_manager_unified import UnifiedPortfolioRiskGate
+        import threading
+        UnifiedPortfolioRiskGate.reset_instance()
         bridge = BrokerBridge.__new__(BrokerBridge)
         bridge._adapter = adapter
         bridge._broker_name = adapter.name
@@ -203,6 +209,13 @@ class TestBrokerBridgeAllBrokers:
         bridge._diary_path = diary_path
         bridge._positions = {}
         bridge._config = {}
+        bridge._oco_pairs = {}
+        bridge._trailing_stops = {}
+        bridge._risk_manager = None
+        bridge._portfolio_gate = UnifiedPortfolioRiskGate.get_instance()
+        bridge._position_lock = threading.Lock()
+        bridge._commission = CommissionModel()
+        bridge._max_holding_bars = 240
         return bridge
 
     def test_ib_buy_with_tp_sl(self, mock_ib_adapter, temp_diary):
@@ -264,7 +277,9 @@ class TestBrokerBridgeAllBrokers:
 class TestForceClose:
 
     def test_force_close_losing_position(self, mock_ib_adapter, temp_diary):
-        from shared.daemon.broker_bridge import BrokerBridge, Position
+        from shared.daemon.broker_bridge import BrokerBridge, Position, CommissionModel
+        from shared.risk_manager_unified import UnifiedPortfolioRiskGate
+        import threading
         bridge = BrokerBridge.__new__(BrokerBridge)
         bridge._adapter = mock_ib_adapter
         bridge._positions = {
@@ -277,6 +292,14 @@ class TestForceClose:
         bridge._default_sl_pct = 2.0
         bridge._broker_name = "ib"
         bridge._capital = 100_000.0
+        bridge._oco_pairs = {}
+        bridge._trailing_stops = {}
+        bridge._risk_manager = None
+        bridge._portfolio_gate = UnifiedPortfolioRiskGate.get_instance()
+        bridge._position_lock = threading.Lock()
+        bridge._commission = CommissionModel()
+        bridge._max_holding_bars = 240
+        bridge._config = {}
 
         # Mock price drop of 6% (exceeds 5% max)
         mock_ib_adapter.get_latest_price = lambda s: 150.0  # 160 → 150 = -6.25%
@@ -287,7 +310,9 @@ class TestForceClose:
         assert "AAPL" not in bridge._positions
 
     def test_no_force_close_within_threshold(self, mock_ib_adapter, temp_diary):
-        from shared.daemon.broker_bridge import BrokerBridge, Position
+        from shared.daemon.broker_bridge import BrokerBridge, Position, CommissionModel
+        from shared.risk_manager_unified import UnifiedPortfolioRiskGate
+        import threading
         bridge = BrokerBridge.__new__(BrokerBridge)
         bridge._adapter = mock_ib_adapter
         bridge._positions = {
@@ -297,6 +322,14 @@ class TestForceClose:
         bridge._diary_path = temp_diary
         bridge._mode = "paper"
         bridge._broker_name = "ib"
+        bridge._oco_pairs = {}
+        bridge._trailing_stops = {}
+        bridge._risk_manager = None
+        bridge._portfolio_gate = UnifiedPortfolioRiskGate.get_instance()
+        bridge._position_lock = threading.Lock()
+        bridge._commission = CommissionModel()
+        bridge._max_holding_bars = 240
+        bridge._config = {}
 
         mock_ib_adapter.get_latest_price = lambda s: 148.0  # -1.3%, within threshold
         results = bridge.check_and_force_close()
@@ -310,6 +343,7 @@ class TestReconciliation:
 
     def test_reconcile_removes_stale(self, mock_ib_adapter, temp_diary):
         from shared.daemon.broker_bridge import BrokerBridge, Position
+        import threading
         bridge = BrokerBridge.__new__(BrokerBridge)
         bridge._adapter = mock_ib_adapter
         bridge._positions = {
@@ -317,6 +351,7 @@ class TestReconciliation:
             "STALE": Position("STALE", "long", 50, 50.0, datetime.now().isoformat()),
         }
         bridge._diary_path = temp_diary
+        bridge._position_lock = threading.Lock()
 
         # Broker only has AAPL, not STALE
         mock_ib_adapter.get_positions = lambda: [{"symbol": "AAPL", "quantity": 100}]
@@ -328,10 +363,14 @@ class TestReconciliation:
 
     def test_reconcile_detects_missing(self, mock_schwab_adapter, temp_diary):
         from shared.daemon.broker_bridge import BrokerBridge
+        from shared.risk_manager_unified import UnifiedPortfolioRiskGate
+        import threading
         bridge = BrokerBridge.__new__(BrokerBridge)
         bridge._adapter = mock_schwab_adapter
         bridge._positions = {}
         bridge._diary_path = temp_diary
+        bridge._position_lock = threading.Lock()
+        bridge._portfolio_gate = UnifiedPortfolioRiskGate.get_instance()
 
         # Schwab has AAPL but we don't track it
         result = bridge.reconcile_positions()
@@ -344,10 +383,12 @@ class TestTradeDiary:
 
     def test_diary_write_and_read(self, mock_ib_adapter, temp_diary):
         from shared.daemon.broker_bridge import BrokerBridge
+        import threading
         bridge = BrokerBridge.__new__(BrokerBridge)
         bridge._adapter = mock_ib_adapter
         bridge._diary_path = temp_diary
         bridge._mode = "paper"
+        bridge._position_lock = threading.Lock()
 
         bridge._write_diary({"action": "BUY", "symbol": "AAPL", "price": 150.0})
         bridge._write_diary({"action": "SELL", "symbol": "AAPL", "price": 155.0})
@@ -458,13 +499,16 @@ class TestFullPipeline:
     def test_agent_to_broker_pipeline(self, temp_db, sample_ohlcv, mock_ib_adapter, temp_diary):
         """Complete pipeline: agent.decide() → bridge.execute() → diary."""
         from shared.ml.self_learning_agent import SelfLearningAgent, AgentConfig
-        from shared.daemon.broker_bridge import BrokerBridge
+        from shared.daemon.broker_bridge import BrokerBridge, CommissionModel
 
         # Create agent
         config = AgentConfig(db_path=temp_db, min_confidence=0.1)
         agent = SelfLearningAgent(config)
 
         # Create bridge with mock IB
+        from shared.risk_manager_unified import UnifiedPortfolioRiskGate
+        import threading
+        UnifiedPortfolioRiskGate.reset_instance()
         bridge = BrokerBridge.__new__(BrokerBridge)
         bridge._adapter = mock_ib_adapter
         bridge._broker_name = "interactive_brokers"
@@ -478,6 +522,13 @@ class TestFullPipeline:
         bridge._diary_path = temp_diary
         bridge._positions = {}
         bridge._config = {}
+        bridge._oco_pairs = {}
+        bridge._trailing_stops = {}
+        bridge._risk_manager = None
+        bridge._portfolio_gate = UnifiedPortfolioRiskGate.get_instance()
+        bridge._position_lock = threading.Lock()
+        bridge._commission = CommissionModel()
+        bridge._max_holding_bars = 240
 
         # Agent decides
         decision = agent.decide(sample_ohlcv, symbol="SPY")
@@ -500,6 +551,10 @@ class TestFullPipeline:
         from shared.daemon.broker_bridge import BrokerBridge
 
         for adapter in [mock_ib_adapter, mock_ts_adapter, mock_schwab_adapter]:
+            from shared.risk_manager_unified import UnifiedPortfolioRiskGate
+            from shared.daemon.broker_bridge import CommissionModel
+            import threading
+            UnifiedPortfolioRiskGate.reset_instance()
             bridge = BrokerBridge.__new__(BrokerBridge)
             bridge._adapter = adapter
             bridge._broker_name = adapter.name
@@ -513,6 +568,13 @@ class TestFullPipeline:
             bridge._diary_path = temp_diary
             bridge._positions = {}
             bridge._config = {}
+            bridge._oco_pairs = {}
+            bridge._trailing_stops = {}
+            bridge._risk_manager = None
+            bridge._portfolio_gate = UnifiedPortfolioRiskGate.get_instance()
+            bridge._position_lock = threading.Lock()
+            bridge._commission = CommissionModel()
+            bridge._max_holding_bars = 240
 
             decision = {"action": "BUY", "confidence": 0.75, "price": 100.0}
             result = bridge.execute_decision(decision, "TEST", agent=None)
@@ -571,6 +633,5 @@ class TestPublicDataFetcher:
     def test_market_status(self):
         from shared.data.public_data_fetcher import PublicDataFetcher
         fetcher = PublicDataFetcher(cache_enabled=False)
-        status = fetcher.get_market_status()
-        assert "is_open" in status
-        assert isinstance(status["is_open"], bool)
+        is_open = fetcher.is_market_open()
+        assert isinstance(is_open, bool)

@@ -22,7 +22,7 @@ Variables:
     RiskAmount(0),
     ShareSize(0),
     StopDistance(0),
-    intrabarpersalivet(false);
+    IntraBarPersist(false);
 
 FastMA = Average(Close, FastMALength);
 SlowMA = Average(Close, SlowMALength);

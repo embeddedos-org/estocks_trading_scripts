@@ -7,10 +7,20 @@ declare lower;
 # --- Inputs ---
 input daysBeforeEarnings = 5;
 input ivRankThreshold = 50;
-input positionSize = 100;
 input showLabels = yes;
 input showEarningsMarkers = yes;
 input ivLookbackPeriod = 252;
+
+# --- ATR Stop Loss Inputs ---
+input stopLossATRMult = 2.0;
+input atrLength = 14;
+
+# --- Position Sizing Inputs ---
+input riskPercent = 2.0;
+input accountSize = 100000;
+
+# --- Cooldown Inputs ---
+input cooldownBars = 20;
 
 # --- Implied Volatility Data ---
 def currentIV = if !IsNaN(imp_volatility()) then imp_volatility() * 100 else 0;
@@ -42,11 +52,34 @@ def daysToEarnings = fold i = 1 to daysBeforeEarnings + 2
 def earningsWithinRange = daysToEarnings > 0 and daysToEarnings <= daysBeforeEarnings;
 def earningsTomorrow = daysToEarnings == 1;
 
+# --- ATR Calculation ---
+def atrStop = ATR(atrLength);
+
+# --- ATR-Based Position Sizing ---
+def stopDistance = stopLossATRMult * atrStop;
+def riskAmount = accountSize * riskPercent / 100.0;
+def calcShares = Floor(riskAmount / stopDistance);
+def dynamicSize = if calcShares > 0 then calcShares else 1;
+
+# --- Consecutive Loss Tracking & Cooldown ---
+rec lastLossBar = if inPosition[1] and exitCondition[1] and close[1] < entryPrice[1]
+    then BarNumber()
+    else lastLossBar[1];
+
+rec lossCount = if close crosses below entryPrice
+    then lossCount[1] + 1
+    else if close crosses above entryPrice
+    then 0
+    else lossCount[1];
+
+def inCooldown = lossCount >= 3 and BarNumber() - lastLossBar < cooldownBars;
+
 # --- Entry / Exit Conditions ---
 def entryCondition = earningsWithinRange
     and !earningsTomorrow
     and ivRank >= ivRankThreshold
-    and close > Average(close, 20);
+    and close > Average(close, 20)
+    and !inCooldown;
 
 def exitCondition = earningsTomorrow or hasEarningsToday;
 
@@ -65,7 +98,7 @@ rec entryPrice = if entrySignal then close else if inPosition then entryPrice[1]
 AddOrder(OrderType.BUY_TO_OPEN,
     entrySignal,
     close,
-    positionSize,
+    dynamicSize,
     Color.GREEN,
     Color.GREEN,
     "Earnings Entry");
@@ -73,14 +106,34 @@ AddOrder(OrderType.BUY_TO_OPEN,
 AddOrder(OrderType.SELL_TO_CLOSE,
     exitSignal,
     close,
-    positionSize,
+    dynamicSize,
     Color.RED,
     Color.RED,
     "Pre-Earnings Exit");
 
+# --- ATR Stop Loss Exits ---
+def longStop = entryPrice - stopLossATRMult * atrStop;
+def shortStop = entryPrice + stopLossATRMult * atrStop;
+
+AddOrder(OrderType.SELL_TO_CLOSE,
+    inPosition and close < longStop,
+    close,
+    dynamicSize,
+    Color.RED,
+    Color.RED,
+    "ATR Stop");
+
+AddOrder(OrderType.BUY_TO_CLOSE,
+    inPosition and close > shortStop,
+    close,
+    dynamicSize,
+    Color.RED,
+    Color.RED,
+    "ATR Stop");
+
 # --- P&L Tracking ---
-def unrealizedPL = if inPosition then (close - entryPrice) * positionSize else 0;
-rec realizedPL = if exitSignal then realizedPL[1] + (close - entryPrice) * positionSize
+def unrealizedPL = if inPosition then (close - entryPrice) * dynamicSize else 0;
+rec realizedPL = if exitSignal then realizedPL[1] + (close - entryPrice) * dynamicSize
     else realizedPL[1];
 rec tradeCount = if exitSignal then tradeCount[1] + 1 else tradeCount[1];
 rec winCount = if exitSignal and close > entryPrice then winCount[1] + 1 else winCount[1];
@@ -141,7 +194,7 @@ AddChartBubble(entrySignal, ivRank,
     Color.GREEN, no);
 
 AddChartBubble(exitSignal, ivRank,
-    "SELL\nP&L:$" + Round((close - entryPrice) * positionSize, 2),
+    "SELL\nP&L:$" + Round((close - entryPrice) * dynamicSize, 2),
     if close >= entryPrice then Color.GREEN else Color.RED, yes);
 
 # --- Labels ---

@@ -45,9 +45,15 @@ except ImportError:
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+_parent_path = os.path.join(os.path.dirname(__file__), "..")
+if _parent_path not in sys.path:
+    sys.path.insert(0, _parent_path)
 
-from shared.indicators.technical_indicators import TechnicalIndicators as TI
+try:
+    from shared.indicators.technical_indicators import TechnicalIndicators as TI
+except ImportError:
+    TI = None  # type: ignore[assignment,misc]
+    logger.warning("shared.indicators not available — TechnicalIndicators will be None")
 
 
 def _require_zipline() -> None:
@@ -254,7 +260,7 @@ class ZiplineStrategyAdapter:
 
         peak = np.maximum.accumulate(equity)
         dd = (np.array(equity) - peak) / peak
-        max_dd = float(np.abs(np.min(dd))) if len(dd) > 0 else 0
+        max_dd = -abs(float(np.min(dd))) if len(dd) > 0 else 0
 
         n_trades = 0
         if "transactions" in perf.columns:
@@ -264,11 +270,30 @@ class ZiplineStrategyAdapter:
 
         return BacktestResultV2(
             total_return=round(total_return, 6),
+            cagr=0.0,
             sharpe_ratio=round(float(sharpe), 4),
             sortino_ratio=round(float(sortino), 4),
             max_drawdown=round(max_dd, 6),
+            calmar_ratio=0.0,
+            win_rate=0.0,
+            profit_factor=0.0,
             total_trades=n_trades,
-            equity_curve=equity,
+            expectancy=0.0,
+            avg_trade_duration=0.0,
+            max_consecutive_wins=0,
+            max_consecutive_losses=0,
+            monthly_returns=pd.Series(dtype=float),
+            alpha=0.0,
+            beta=0.0,
+            information_ratio=0.0,
+            tracking_error=0.0,
+            equity_curve=pd.Series(equity, dtype=float),
+            trade_log=[],
+            trades=[],
+            long_trades=0,
+            short_trades=0,
+            avg_win=0.0,
+            avg_loss=0.0,
         )
 
     @staticmethod

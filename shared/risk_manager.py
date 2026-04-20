@@ -16,11 +16,15 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
+from pathlib import Path
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
@@ -72,6 +76,9 @@ class RiskManagerConfig:
     # Capital
     total_capital: float = 100000.0
 
+    # State persistence (crash recovery)
+    persist_path: Optional[str] = None
+
 
 @dataclass
 class TradeRecord:
@@ -122,6 +129,106 @@ class RiskManager:
 
         # Trade history
         self._trade_history: List[TradeRecord] = []
+
+        # State persistence
+        self._persist_conn: Optional[sqlite3.Connection] = None
+        self._persist_lock = threading.Lock()
+        if self.config.persist_path:
+            self._init_persistence(self.config.persist_path)
+            self._load_state()
+
+    # ─── State Persistence ───
+
+    def _init_persistence(self, db_path: str) -> None:
+        """Initialize the SQLite database for state persistence."""
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._persist_conn = sqlite3.connect(db_path, check_same_thread=False)
+        # FIX 8: SQLite WAL mode for better concurrency
+        self._persist_conn.execute("PRAGMA journal_mode=WAL")
+        self._persist_conn.execute("PRAGMA busy_timeout=5000")
+        self._persist_conn.execute(
+            "CREATE TABLE IF NOT EXISTS risk_state "
+            "(key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)"
+        )
+        self._persist_conn.commit()
+        logger.info("RiskManager persistence initialized: %s", db_path)
+
+    def _save_state(self) -> None:
+        """Persist current risk state to SQLite."""
+        if self._persist_conn is None:
+            return
+
+        now = datetime.now().isoformat()
+        state = {
+            "daily_pnl": self._daily_pnl,
+            "daily_pnl_date": self._daily_pnl_date.isoformat(),
+            "consecutive_losses": self._consecutive_losses,
+            "current_equity": self._current_equity,
+            "peak_equity": self._peak_equity,
+            "circuit_breaker_until": self._circuit_breaker_until,
+            "cooldown_until": self._cooldown_until,
+            "daily_trade_count": self._daily_trade_count,
+            "open_positions": self._open_positions,
+        }
+
+        with self._persist_lock:
+            try:
+                for key, value in state.items():
+                    self._persist_conn.execute(
+                        "INSERT OR REPLACE INTO risk_state (key, value, updated_at) "
+                        "VALUES (?, ?, ?)",
+                        (key, json.dumps(value), now),
+                    )
+                self._persist_conn.commit()
+            except Exception as e:
+                logger.error("Failed to save risk state: %s", e)
+
+    def _load_state(self) -> None:
+        """Restore risk state from SQLite on startup."""
+        if self._persist_conn is None:
+            return
+
+        with self._persist_lock:
+            try:
+                rows = self._persist_conn.execute(
+                    "SELECT key, value FROM risk_state"
+                ).fetchall()
+            except Exception as e:
+                logger.error("Failed to load risk state: %s", e)
+                return
+
+        if not rows:
+            logger.info("No persisted risk state found — starting fresh")
+            return
+
+        state = {key: json.loads(value) for key, value in rows}
+
+        saved_date_str = state.get("daily_pnl_date")
+        if saved_date_str:
+            saved_date = date.fromisoformat(saved_date_str)
+            if saved_date == date.today():
+                self._daily_pnl = float(state.get("daily_pnl", 0.0))
+                self._daily_trade_count = int(state.get("daily_trade_count", 0))
+                self._daily_pnl_date = saved_date
+            else:
+                logger.info("Persisted state is from %s — resetting daily counters", saved_date_str)
+
+        self._consecutive_losses = int(state.get("consecutive_losses", 0))
+        self._current_equity = float(state.get("current_equity", self.config.total_capital))
+        self._peak_equity = float(state.get("peak_equity", self.config.total_capital))
+        self._circuit_breaker_until = float(state.get("circuit_breaker_until", 0.0))
+        self._cooldown_until = float(state.get("cooldown_until", 0.0))
+
+        positions = state.get("open_positions")
+        if isinstance(positions, dict):
+            self._open_positions = {k: float(v) for k, v in positions.items()}
+
+        logger.info(
+            "Risk state restored: equity=$%.2f, daily_pnl=$%.2f, "
+            "consecutive_losses=%d, positions=%d",
+            self._current_equity, self._daily_pnl,
+            self._consecutive_losses, len(self._open_positions),
+        )
 
     def _reset_daily_if_needed(self) -> None:
         """Reset daily counters if a new day has started."""
@@ -229,7 +336,7 @@ class RiskManager:
         self._reset_daily_if_needed()
 
         # Daily loss limit
-        if abs(self._daily_pnl) >= self.config.max_daily_loss:
+        if self._daily_pnl <= -self.config.max_daily_loss:
             logger.warning(
                 "Daily loss limit reached: $%.2f (max: $%.2f)",
                 self._daily_pnl,
@@ -381,6 +488,9 @@ class RiskManager:
 
         # Record in history
         self._trade_history.append(TradeRecord(symbol=symbol, pnl=pnl))
+        # FIX 9: Trim trade history to prevent unbounded growth
+        if len(self._trade_history) > 1000:
+            self._trade_history = self._trade_history[-500:]
         logger.info(
             "Trade recorded: %s P&L=$%.2f | Daily P&L=$%.2f | Equity=$%.2f",
             symbol,
@@ -388,6 +498,7 @@ class RiskManager:
             self._daily_pnl,
             self._current_equity,
         )
+        self._save_state()
 
     # ─── Position Tracking ───
 
@@ -405,6 +516,7 @@ class RiskManager:
             risk_amount,
             len(self._open_positions),
         )
+        self._save_state()
 
     def remove_position(self, symbol: str) -> None:
         """Remove a closed position from tracking.
@@ -419,6 +531,7 @@ class RiskManager:
                 symbol,
                 len(self._open_positions),
             )
+            self._save_state()
 
     # ─── Status ───
 

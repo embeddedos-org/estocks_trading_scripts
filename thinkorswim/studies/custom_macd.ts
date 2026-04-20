@@ -14,11 +14,11 @@ input showAlerts = yes;
 input showDivergence = yes;
 
 # --- MACD Calculation ---
-def fastMA = MovAvgExponential(close, fastLength);
-def slowMA = MovAvgExponential(close, slowLength);
+def fastMA = MovingAverage(averageType, close, fastLength);
+def slowMA = MovingAverage(averageType, close, slowLength);
 
 plot MACDLine = fastMA - slowMA;
-plot SignalLine = MovAvgExponential(MACDLine, signalLength);
+plot SignalLine = MovingAverage(averageType, MACDLine, signalLength);
 plot Histogram = MACDLine - SignalLine;
 
 MACDLine.SetDefaultColor(Color.CYAN);

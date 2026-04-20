@@ -63,7 +63,6 @@ Regime.SetLineWeight(3);
 Regime.Hide();
 
 # ─── Regime Label ───
-def RegimeText = RegimeValue;
 AddLabel(yes,
     if RegimeValue == 2 then "REGIME: TRENDING"
     else if RegimeValue == 1 then "REGIME: RANGING"

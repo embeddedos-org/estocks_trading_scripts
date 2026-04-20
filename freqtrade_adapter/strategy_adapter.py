@@ -37,7 +37,12 @@ except ImportError:
     logger.debug("freqtrade not installed — adapter unavailable")
 
     class IStrategy:  # type: ignore[no-redef]
-        """Stub for when freqtrade is not installed."""
+        """Stub so subclasses can be defined even without freqtrade installed.
+
+        WARNING: This is a minimal stub. isinstance() checks against the real
+        freqtrade IStrategy will fail when using this stub. Only use for
+        offline development/testing without a freqtrade installation.
+        """
         timeframe = "5m"
         def populate_indicators(self, dataframe: pd.DataFrame, metadata: dict) -> pd.DataFrame:
             return dataframe
@@ -48,9 +53,15 @@ except ImportError:
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+_parent_path = os.path.join(os.path.dirname(__file__), "..")
+if _parent_path not in sys.path:
+    sys.path.insert(0, _parent_path)
 
-from shared.indicators.technical_indicators import TechnicalIndicators as TI
+try:
+    from shared.indicators.technical_indicators import TechnicalIndicators as TI
+except ImportError:
+    TI = None  # type: ignore[assignment,misc]
+    logger.warning("shared.indicators not available — TechnicalIndicators will be None")
 
 
 class StocksPluginStrategy(IStrategy):

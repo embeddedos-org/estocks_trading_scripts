@@ -56,10 +56,7 @@ class Position:
             return (self.unrealized_pnl / abs(self.total_cost)) * 100.0
         return 0.0
 
-    @property
-    def weight(self) -> float:
-        """Position weight as fraction of market value (set externally)."""
-        return 0.0
+    weight: float = 0.0
 
 
 @dataclass
@@ -187,18 +184,21 @@ class PortfolioTracker:
             )
 
             if hasattr(item, 'contract') and sec_type == "OPT":
-                try:
-                    ticker = self.connection.ib.reqMktData(item.contract)
-                    self.connection.ib.sleep(1)
-                    if ticker.modelGreeks:
-                        multiplier = item.position * 100
-                        pos.delta = ticker.modelGreeks.delta * multiplier
-                        pos.gamma = ticker.modelGreeks.gamma * multiplier
-                        pos.theta = ticker.modelGreeks.theta * multiplier
-                        pos.vega = ticker.modelGreeks.vega * multiplier
-                    self.connection.ib.cancelMktData(item.contract)
-                except Exception as e:
-                    logger.debug("Could not fetch Greeks for %s: %s", symbol, e)
+                if not hasattr(self.connection, 'ib'):
+                    logger.warning("Greeks require IBAsyncConnection")
+                else:
+                    try:
+                        ticker = self.connection.ib.reqMktData(item.contract)
+                        self.connection.ib.sleep(1)
+                        if ticker.modelGreeks:
+                            multiplier = item.position * (int(item.contract.multiplier) if hasattr(item.contract, 'multiplier') and item.contract.multiplier else 100)
+                            pos.delta = ticker.modelGreeks.delta * multiplier
+                            pos.gamma = ticker.modelGreeks.gamma * multiplier
+                            pos.theta = ticker.modelGreeks.theta * multiplier
+                            pos.vega = ticker.modelGreeks.vega * multiplier
+                        self.connection.ib.cancelMktData(item.contract)
+                    except Exception as e:
+                        logger.debug("Could not fetch Greeks for %s: %s", symbol, e)
 
             positions.append(pos)
 

@@ -277,6 +277,8 @@ class MLRegimeClassifier:
         df: pd.DataFrame,
         lookforward: int = 20,
         test_size: float = 0.2,
+        use_walk_forward: bool = True,
+        n_splits: int = 5,
     ) -> Dict[str, Any]:
         """Train the regime classifier.
 
@@ -284,6 +286,8 @@ class MLRegimeClassifier:
             df: OHLCV DataFrame.
             lookforward: Bars to look forward for labeling.
             test_size: Fraction reserved for validation.
+            use_walk_forward: If True, run walk-forward CV before final training.
+            n_splits: Number of walk-forward splits.
 
         Returns:
             Dict with training metrics (accuracy, classification_report).
@@ -310,6 +314,32 @@ class MLRegimeClassifier:
 
         self._feature_names = list(features.columns)
 
+        # LightGBM params
+        self._lgb_params = {
+            "n_estimators": self._n_estimators,
+            "max_depth": self._max_depth,
+            "learning_rate": self._learning_rate,
+            "random_state": self._random_state,
+            "num_class": 3,
+            "objective": "multiclass",
+            "metric": "multi_logloss",
+            "verbosity": -1,
+            "class_weight": "balanced",
+        }
+
+        # Walk-forward cross-validation (GAP 13)
+        if use_walk_forward and len(features) > 200:
+            cv_scores = self._walk_forward_cv(
+                features.values, labels.values, n_splits=n_splits,
+            )
+            avg_cv = float(np.mean(cv_scores))
+            logger.info(
+                "Walk-forward CV (%d splits): scores=%s, avg=%.4f",
+                n_splits,
+                [round(s, 4) for s in cv_scores],
+                avg_cv,
+            )
+
         # Train/test split (temporal, not random)
         split_idx = int(len(features) * (1 - test_size))
         X_train = features.iloc[:split_idx]
@@ -327,16 +357,7 @@ class MLRegimeClassifier:
             count = (y_train == regime_id).sum()
             logger.info("  %s: %d samples (%.1f%%)", name, count, count / len(y_train) * 100)
 
-        self._model = lgb.LGBMClassifier(
-            n_estimators=self._n_estimators,
-            max_depth=self._max_depth,
-            learning_rate=self._learning_rate,
-            random_state=self._random_state,
-            num_class=3,
-            objective="multiclass",
-            metric="multi_logloss",
-            verbosity=-1,
-        )
+        self._model = lgb.LGBMClassifier(**self._lgb_params)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -352,6 +373,9 @@ class MLRegimeClassifier:
         accuracy = float(np.mean(y_pred == y_test))
 
         report: Dict[str, Any] = {"accuracy": accuracy}
+        if use_walk_forward and len(features) > 200:
+            report["walk_forward_cv_avg"] = avg_cv
+            report["walk_forward_cv_scores"] = cv_scores
         for regime_id, name in _REGIME_NAMES.items():
             mask = y_test == regime_id
             if mask.sum() > 0:
@@ -360,6 +384,43 @@ class MLRegimeClassifier:
 
         logger.info("Training complete. Test accuracy: %.2f%%", accuracy * 100)
         return report
+
+    def _walk_forward_cv(self, X: np.ndarray, y: np.ndarray, n_splits: int = 5) -> List[float]:
+        """Time-series walk-forward cross-validation.
+
+        Each fold trains on all data up to the split point and tests
+        on the next segment, preserving temporal order.
+
+        Args:
+            X: Feature matrix.
+            y: Label array.
+            n_splits: Number of CV folds.
+
+        Returns:
+            List of accuracy scores per fold.
+        """
+        fold_size = len(X) // (n_splits + 1)
+        scores: List[float] = []
+        for i in range(n_splits):
+            train_end = fold_size * (i + 2)
+            test_end = min(train_end + fold_size, len(X))
+            X_train, y_train = X[:train_end], y[:train_end]
+            X_test, y_test = X[train_end:test_end], y[train_end:test_end]
+
+            if len(X_test) == 0:
+                continue
+
+            model = lgb.LGBMClassifier(**self._lgb_params)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                model.fit(X_train, y_train)
+            score = float(model.score(X_test, y_test))
+            scores.append(score)
+            logger.debug(
+                "Walk-forward fold %d: train=%d, test=%d, accuracy=%.4f",
+                i + 1, len(X_train), len(X_test), score,
+            )
+        return scores
 
     # ─── Prediction ───
 

@@ -202,6 +202,9 @@ def cmd_backtest(args: argparse.Namespace) -> None:
         result = strategy.run_backtest(universe, initial_capital=args.capital)
         _print_result(result)
 
+        if args.chart:
+            _render_chart(result)
+
         if args.output:
             with open(args.output, "w") as f:
                 json.dump(_result_to_dict(result), f, indent=2)

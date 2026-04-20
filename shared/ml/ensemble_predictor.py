@@ -22,9 +22,12 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+import copy
 
 import numpy as np
 
@@ -124,6 +127,7 @@ class EnsemblePredictor:
         self._buy_threshold = buy_threshold
         self._sell_threshold = sell_threshold
         self._min_confidence = min_confidence
+        self._regime_multipliers = copy.deepcopy(_REGIME_MULTIPLIERS)
 
         # Adaptive weights (updated from TradeMemory)
         self._model_weights: Dict[str, ModelWeight] = {
@@ -160,7 +164,7 @@ class EnsemblePredictor:
         normalized = self._normalize_predictions(predictions)
 
         # Apply regime-specific multipliers
-        regime_mults = _REGIME_MULTIPLIERS.get(regime, _REGIME_MULTIPLIERS["UNKNOWN"])
+        regime_mults = self._regime_multipliers.get(regime, self._regime_multipliers["UNKNOWN"])
 
         # Calculate weighted score
         weighted_sum = 0.0
@@ -315,6 +319,69 @@ class EnsemblePredictor:
             for k, v in all_accuracies.items()
         }
 
+        # GAP #3: Also update regime multipliers from trade memory
+        self.update_regime_multipliers_from_memory(trade_memory)
+
+    def update_regime_multipliers_from_memory(self, trade_memory: Any) -> None:
+        """Update regime-specific model weights based on actual trade outcomes.
+
+        Args:
+            trade_memory: TradeMemory instance with get_model_accuracy(name, regime=regime).
+        """
+        for regime in ["TRENDING", "RANGING", "VOLATILE"]:
+            for model_name in self._regime_multipliers.get(regime, {}):
+                try:
+                    accuracy = trade_memory.get_model_accuracy(model_name, regime=regime)
+                    if accuracy is not None and accuracy.get("total_predictions", 0) >= 10:
+                        acc_rate = accuracy["accuracy"]
+                        # Scale multiplier: 0.5 at 40% accuracy, 1.0 at 50%, 1.5 at 60%
+                        new_mult = max(0.3, min(2.0, acc_rate * 2.0))
+                        self._regime_multipliers[regime][model_name] = new_mult
+                        logger.info(
+                            "Regime multiplier updated: %s/%s = %.2f (accuracy=%.1f%%)",
+                            regime, model_name, new_mult, acc_rate * 100,
+                        )
+                except Exception as e:
+                    logger.debug("Failed to update regime multiplier %s/%s: %s", regime, model_name, e)
+
+    def save_weights(self, path: str) -> None:
+        """Persist current model weights and regime multipliers to JSON.
+
+        Args:
+            path: File path to save weights JSON.
+        """
+        data = {
+            "model_weights": {
+                k: {"base": v.base_weight, "accuracy": v.accuracy_weight}
+                for k, v in self._model_weights.items()
+            },
+            "regime_multipliers": self._regime_multipliers,
+        }
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        logger.info("Ensemble weights saved to %s", path)
+
+    def load_weights(self, path: str) -> None:
+        """Load persisted weights from JSON.
+
+        Args:
+            path: File path to load weights from.
+        """
+        if not os.path.exists(path):
+            logger.debug("No saved weights at %s", path)
+            return
+        with open(path) as f:
+            data = json.load(f)
+        for name, w in data.get("model_weights", {}).items():
+            if name in self._model_weights:
+                self._model_weights[name].accuracy_weight = w.get("accuracy", 1.0)
+        loaded_mults = data.get("regime_multipliers", {})
+        for regime, models in loaded_mults.items():
+            if regime in self._regime_multipliers:
+                self._regime_multipliers[regime].update(models)
+        logger.info("Ensemble weights loaded from %s", path)
+
     def update_regime_weights(
         self,
         regime: str,
@@ -328,8 +395,8 @@ class EnsemblePredictor:
             model_name: Model to adjust.
             multiplier: New regime multiplier.
         """
-        if regime in _REGIME_MULTIPLIERS:
-            _REGIME_MULTIPLIERS[regime][model_name] = multiplier
+        if regime in self._regime_multipliers:
+            self._regime_multipliers[regime][model_name] = multiplier
             logger.info(
                 "Regime weight updated: %s/%s = %.2f",
                 regime, model_name, multiplier,

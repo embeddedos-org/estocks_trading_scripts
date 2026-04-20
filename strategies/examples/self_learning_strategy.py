@@ -46,7 +46,6 @@ from shared.backtesting.backtest_engine_v2 import (
     BacktestEngineV2,
     BacktestResultV2,
 )
-from shared.indicators.technical_indicators import TechnicalIndicators as TI
 from strategies import register_strategy
 
 
@@ -60,6 +59,7 @@ class SelfLearningConfig:
     sell_threshold: float = -0.15
     min_confidence: float = 0.3
     adaptive_thresholds: bool = True
+    stop_loss_pct: float = 0.05  # 5% stop loss
 
 
 @register_strategy("self_learning")
@@ -84,6 +84,7 @@ class SelfLearningStrategy:
         self._agent = None
         self._trained = False
         self._fallback = False
+        self._entry_prices: Dict[str, float] = {}
 
         # Create agent
         try:
@@ -135,8 +136,27 @@ class SelfLearningStrategy:
                 signals[sym] = 0
                 continue
 
+            current_price = float(df["close"].iloc[-1])
+            current_pos = ctx.positions.get(sym, 0)
+
+            # Stop loss check on held positions
+            if current_pos != 0 and sym in self._entry_prices:
+                entry = self._entry_prices[sym]
+                if current_pos > 0 and current_price < entry * (1 - self.config.stop_loss_pct):
+                    signals[sym] = 0
+                    self._entry_prices.pop(sym, None)
+                    continue
+                elif current_pos < 0 and current_price > entry * (1 + self.config.stop_loss_pct):
+                    signals[sym] = 0
+                    self._entry_prices.pop(sym, None)
+                    continue
+
             if self._fallback or self._agent is None:
                 signals[sym] = self._momentum_signal(df)
+                if signals[sym] == 1 and current_pos <= 0:
+                    self._entry_prices[sym] = current_price
+                elif signals[sym] == -1 and current_pos >= 0:
+                    self._entry_prices[sym] = current_price
                 continue
 
             try:
@@ -145,21 +165,20 @@ class SelfLearningStrategy:
 
                 if action == "BUY":
                     signals[sym] = 1
+                    self._entry_prices[sym] = current_price
                 elif action == "SELL":
                     signals[sym] = -1
+                    self._entry_prices[sym] = current_price
                 else:
                     signals[sym] = 0
 
                 # Record outcome from previous trade if position changed
                 prev_pos = ctx.positions.get(sym, 0)
-                current_price = float(df["close"].iloc[-1])
 
                 if prev_pos != 0 and signals[sym] != prev_pos:
-                    # Position is changing — record outcome of previous trade
-                    pnl = 0.0
-                    if hasattr(ctx, 'entry_prices') and sym in ctx.entry_prices:
-                        entry = ctx.entry_prices[sym]
-                        pnl = (current_price - entry) * prev_pos
+                    entry = self._entry_prices.get(sym, current_price)
+                    pnl = (current_price - entry) * prev_pos
+                    self._entry_prices.pop(sym, None)
                     self._agent.record_outcome(
                         exit_price=current_price,
                         pnl=pnl,

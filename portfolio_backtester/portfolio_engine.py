@@ -138,16 +138,27 @@ class PortfolioEngine:
         equity_values = equity.values
         initial = self.config.initial_capital
 
+        # bt returns rebased prices (100-based), not absolute equity.
+        # Detect and convert back to absolute values.
+        if len(equity_values) > 0 and abs(equity_values[0] - 100.0) < 1.0:
+            equity_values = equity_values / 100.0 * initial
+
         total_return = (equity_values[-1] - initial) / initial
         n_days = max((equity.index[-1] - equity.index[0]).days, 1)
         n_years = n_days / 365.25
-        cagr = (equity_values[-1] / initial) ** (1 / n_years) - 1 if n_years > 0 else 0.0
+        final_ratio = max(0.0001, equity_values[-1] / initial)
+        cagr = final_ratio ** (1 / n_years) - 1 if n_years > 0 else 0.0
 
         returns = equity.pct_change().dropna()
         sharpe = float(returns.mean() / returns.std() * np.sqrt(252)) if returns.std() > 0 else 0.0
 
         neg_ret = returns[returns < 0]
-        downside = float(neg_ret.std()) if len(neg_ret) > 0 else 1e-10
+        if len(neg_ret) <= 1:
+            downside = float(abs(neg_ret.mean())) if len(neg_ret) == 1 else 1e-10
+        else:
+            downside = float(neg_ret.std())
+        if downside == 0:
+            downside = 1e-10
         sortino = float(returns.mean() / downside * np.sqrt(252))
 
         peak = np.maximum.accumulate(equity_values)

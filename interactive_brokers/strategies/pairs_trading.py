@@ -85,11 +85,13 @@ class PairsTradingBot:
         order_manager: Any,
         notifier: Any = None,
         capital: float = 100000.0,
+        max_z_score: float = 4.0,
     ) -> None:
         self.connection = connection
         self.order_manager = order_manager
         self.notifier = notifier
         self.capital = capital
+        self.max_z_score = max_z_score
 
         self._state = PairState.FLAT
         self._current_trade: Optional[PairsTrade] = None
@@ -272,6 +274,36 @@ class PairsTradingBot:
         current_z = zscore.iloc[-1]
         current_spread = spread.iloc[-1]
 
+        if pd.isna(current_z):
+            return PairSignal(
+                timestamp=datetime.now(),
+                symbol_a=symbol_a,
+                symbol_b=symbol_b,
+                spread=current_spread if not pd.isna(current_spread) else 0.0,
+                z_score=0.0,
+                hedge_ratio=self._hedge_ratio,
+                state=self._state,
+                action="HOLD",
+            )
+
+        # Emergency exit if z-score exceeds max threshold
+        if abs(current_z) > self.max_z_score:
+            logger.warning(
+                "Emergency exit: z-score %.2f exceeds max %.2f",
+                current_z, self.max_z_score,
+            )
+            if self._state != PairState.FLAT:
+                return PairSignal(
+                    timestamp=datetime.now(),
+                    symbol_a=symbol_a,
+                    symbol_b=symbol_b,
+                    spread=current_spread,
+                    z_score=current_z,
+                    hedge_ratio=self._hedge_ratio,
+                    state=self._state,
+                    action="EXIT",
+                )
+
         action = "HOLD"
 
         if self._state == PairState.FLAT:
@@ -280,15 +312,15 @@ class PairsTradingBot:
             elif current_z < -entry_z:
                 action = "LONG_SPREAD"
         elif self._state == PairState.LONG_SPREAD:
-            if current_z > -exit_z:
-                action = "EXIT"
             if current_z > entry_z:
                 action = "REVERSE_TO_SHORT"
-        elif self._state == PairState.SHORT_SPREAD:
-            if current_z < exit_z:
+            elif current_z > -exit_z:
                 action = "EXIT"
+        elif self._state == PairState.SHORT_SPREAD:
             if current_z < -entry_z:
                 action = "REVERSE_TO_LONG"
+            elif current_z < exit_z:
+                action = "EXIT"
 
         signal = PairSignal(
             timestamp=datetime.now(),

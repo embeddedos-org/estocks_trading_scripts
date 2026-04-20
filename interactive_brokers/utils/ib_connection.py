@@ -80,19 +80,6 @@ class BaseConnection(ABC):
     def trading_mode(self) -> TradingMode:
         return self.config.trading_mode
 
-    def __enter__(self) -> "BaseConnection":
-        self.connect()
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.disconnect()
-
-    async def __aenter__(self) -> "BaseConnection":
-        await self.connect()
-        return self
-
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        self.disconnect()
 
 
 class IBAsyncConnection(BaseConnection):
@@ -105,7 +92,21 @@ class IBAsyncConnection(BaseConnection):
     def __init__(self, config: ConnectionConfig) -> None:
         super().__init__(config)
         self._ib: Any = None
+        self._disconnect_handler_registered: bool = False
         self._import_ib_async()
+
+    def __enter__(self) -> "IBAsyncConnection":
+        raise TypeError("Use 'async with' for IBAsyncConnection")
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.disconnect()
+
+    async def __aenter__(self) -> "IBAsyncConnection":
+        await self.connect()
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.disconnect()
 
     def _import_ib_async(self) -> None:
         """Lazily import ib_async with graceful error handling."""
@@ -174,7 +175,10 @@ class IBAsyncConnection(BaseConnection):
     def _get_account_id(self) -> str:
         """Get the primary account ID."""
         accounts = self._ib.managedAccounts()
-        return accounts[0] if accounts else "unknown"
+        if not accounts:
+            logger.warning("No accounts returned")
+            return "unknown"
+        return accounts[0]
 
     def _setup_auto_reconnect(self) -> None:
         """Register auto-reconnect handler on disconnect events."""
@@ -196,15 +200,93 @@ class IBAsyncConnection(BaseConnection):
             )
             asyncio.ensure_future(self._reconnect_after(wait))
 
+        if self._disconnect_handler_registered:
+            try:
+                self._ib.disconnectedEvent -= self._on_disconnected_handler
+            except Exception:
+                pass
+        self._on_disconnected_handler = on_disconnected
         self._ib.disconnectedEvent += on_disconnected
+        self._disconnect_handler_registered = True
 
     async def _reconnect_after(self, wait: float) -> None:
         """Wait and then attempt to reconnect."""
         await asyncio.sleep(wait)
         try:
             await self.connect()
+            await self._resubmit_protective_orders()
         except ConnectionError:
             logger.error("Reconnection attempt %d failed", self._reconnect_count)
+
+    async def _resubmit_protective_orders(self) -> None:
+        """After reconnect, check open positions and re-submit missing stop-loss orders.
+
+        Queries open positions from the broker and checks for existing
+        protective (stop-loss) orders. If a position has no protective
+        order, a default stop-loss at 2% below the average cost is placed.
+        """
+        if not self.is_connected():
+            return
+
+        try:
+            positions = self._ib.positions()
+            if not positions:
+                logger.info("Reconnected: no open positions — no protective orders needed")
+                return
+
+            open_orders = self._ib.openOrders()
+            symbols_with_stops: set = set()
+            for order in open_orders:
+                if hasattr(order, 'orderType') and order.orderType in ('STP', 'TRAIL'):
+                    if hasattr(order, 'contract') and order.contract:
+                        symbols_with_stops.add(order.contract.symbol)
+
+            resubmitted = 0
+            for pos in positions:
+                qty = float(pos.position) if hasattr(pos, 'position') else 0
+                if abs(qty) == 0:
+                    continue
+
+                symbol = pos.contract.symbol
+                if symbol in symbols_with_stops:
+                    continue
+
+                avg_cost = float(pos.avgCost) if hasattr(pos, 'avgCost') else 0.0
+                if avg_cost <= 0:
+                    continue
+
+                if qty > 0:
+                    stop_price = round(avg_cost * 0.98, 2)
+                    action = "SELL"
+                    order_qty = abs(qty)
+                else:
+                    stop_price = round(avg_cost * 1.02, 2)
+                    action = "BUY"
+                    order_qty = abs(qty)
+
+                try:
+                    contract = self._ib_module.Stock(symbol, "SMART", "USD")
+                    await self._ib.qualifyContractsAsync(contract)
+
+                    stop_order = self._ib_module.StopOrder(
+                        action=action,
+                        totalQuantity=order_qty,
+                        stopPrice=stop_price,
+                    )
+                    self._ib.placeOrder(contract, stop_order)
+                    resubmitted += 1
+                    logger.info(
+                        "Reconnect: resubmitted STP %s %s %.0f @ $%.2f",
+                        action, symbol, order_qty, stop_price,
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Failed to resubmit protective order for %s: %s", symbol, e
+                    )
+
+            logger.info("Reconnected: resubmitted %d protective orders", resubmitted)
+        except Exception as e:
+            logger.error("Failed to resubmit protective orders after reconnect: %s", e)
 
     def reqContractDetails(self, contract: Any) -> Any:
         """Request contract details (passthrough to ib_async)."""
@@ -304,6 +386,19 @@ class IBApiConnection(BaseConnection):
                 "ibapi is required for IBApiConnection. "
                 "Install the official IB API: pip install ibapi"
             )
+
+    def __enter__(self) -> "IBApiConnection":
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.disconnect()
+
+    async def __aenter__(self) -> "IBApiConnection":
+        raise TypeError("Use 'with' for IBApiConnection")
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.disconnect()
 
     def connect(self) -> None:
         """Connect to IB Gateway/TWS using the native ibapi."""

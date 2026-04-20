@@ -37,7 +37,19 @@ from shared.backtesting.backtest_engine_v2 import (
     BacktestResultV2,
 )
 from shared.indicators.technical_indicators import TechnicalIndicators as TI
+from shared.indicators.multi_timeframe import MultiTimeframeTrend
 from strategies import register_strategy
+
+try:
+    from shared.indicators.candlestick_patterns import CandlestickPatterns
+    _HAS_CANDLE_PATTERNS = True
+except ImportError:
+    _HAS_CANDLE_PATTERNS = False
+    CandlestickPatterns = None  # type: ignore[assignment,misc]
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -51,6 +63,11 @@ class TrendFollowingConfig:
     adx_threshold: int = 25
     stop_loss_atr_mult: float = 2.0
     trailing_stop: bool = True
+    use_volume_filter: bool = True
+    volume_ma_length: int = 20
+    use_mtf_filter: bool = True
+    htf_period: str = "1D"
+    use_candle_confirm: bool = False
 
 
 @register_strategy("trend_following")
@@ -64,6 +81,7 @@ class TrendFollowingStrategy:
     def __init__(self, config: TrendFollowingConfig | None = None) -> None:
         self.config = config or TrendFollowingConfig()
         self._trailing_stops: Dict[str, float] = {}
+        self._mtf = MultiTimeframeTrend(htf_period=self.config.htf_period)
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "TrendFollowingStrategy":
@@ -102,6 +120,15 @@ class TrendFollowingStrategy:
             atr = TI.atr(df, 14)
             current_atr = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else current_close * 0.02
 
+            # Volume filter: only generate new BUY/SELL signals when volume > SMA(volume, 20)
+            volume_ok = True
+            if cfg.use_volume_filter and "volume" in df.columns:
+                vol = df["volume"]
+                vol_sma = vol.rolling(cfg.volume_ma_length).mean()
+                current_vol = float(vol.iloc[-1])
+                vol_sma_val = float(vol_sma.iloc[-1]) if not np.isnan(vol_sma.iloc[-1]) else 0
+                volume_ok = current_vol > vol_sma_val
+
             current_pos = ctx.positions.get(sym, 0)
 
             # Trailing stop logic
@@ -125,15 +152,50 @@ class TrendFollowingStrategy:
                         self._trailing_stops.pop(sym, None)
                         continue
 
+            # Candlestick confirmation helper
+            candle_bullish = True
+            candle_bearish = True
+            if cfg.use_candle_confirm and _HAS_CANDLE_PATTERNS:
+                recent = df.iloc[-3:]  # last 3 bars
+                bullish_patterns = CandlestickPatterns.detect_bullish(recent)
+                bearish_patterns = CandlestickPatterns.detect_bearish(recent)
+                candle_bullish = len(bullish_patterns) > 0
+                candle_bearish = len(bearish_patterns) > 0
+                if not candle_bullish:
+                    logger.debug("%s: no bullish candle confirmation in last 3 bars", sym)
+                if not candle_bearish:
+                    logger.debug("%s: no bearish candle confirmation in last 3 bars", sym)
+
+            # Multi-timeframe trend filter
+            mtf_buy_ok = True
+            mtf_sell_ok = True
+            if cfg.use_mtf_filter:
+                mtf_buy_ok = self._mtf.is_aligned(df, "BUY")
+                mtf_sell_ok = self._mtf.is_aligned(df, "SELL")
+
             # Entry / continuation logic
-            if fast_val > slow_val and current_close > trend_val and adx_ok:
-                signals[sym] = 1
-                if current_pos <= 0:
-                    self._trailing_stops[sym] = current_close - cfg.stop_loss_atr_mult * current_atr
-            elif fast_val < slow_val and current_close < trend_val and adx_ok:
-                signals[sym] = -1
-                if current_pos >= 0:
-                    self._trailing_stops[sym] = current_close + cfg.stop_loss_atr_mult * current_atr
+            if fast_val > slow_val and current_close > trend_val and adx_ok and mtf_buy_ok:
+                if current_pos <= 0 and not volume_ok:
+                    # New entry blocked by low volume
+                    signals[sym] = 1 if current_pos > 0 else (-1 if current_pos < 0 else 0)
+                elif cfg.use_candle_confirm and not candle_bullish and current_pos <= 0:
+                    signals[sym] = 0
+                    logger.info("%s: BUY signal skipped — no bullish candle confirmation", sym)
+                else:
+                    signals[sym] = 1
+                    if current_pos <= 0:
+                        self._trailing_stops[sym] = current_close - cfg.stop_loss_atr_mult * current_atr
+            elif fast_val < slow_val and current_close < trend_val and adx_ok and mtf_sell_ok:
+                if current_pos >= 0 and not volume_ok:
+                    # New entry blocked by low volume
+                    signals[sym] = 1 if current_pos > 0 else (-1 if current_pos < 0 else 0)
+                elif cfg.use_candle_confirm and not candle_bearish and current_pos >= 0:
+                    signals[sym] = 0
+                    logger.info("%s: SELL signal skipped — no bearish candle confirmation", sym)
+                else:
+                    signals[sym] = -1
+                    if current_pos >= 0:
+                        self._trailing_stops[sym] = current_close + cfg.stop_loss_atr_mult * current_atr
             elif fast_val < slow_val and current_pos > 0:
                 signals[sym] = 0
                 self._trailing_stops.pop(sym, None)

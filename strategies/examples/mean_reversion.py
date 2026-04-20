@@ -36,6 +36,7 @@ from shared.backtesting.backtest_engine_v2 import (
     BacktestResultV2,
 )
 from shared.indicators.technical_indicators import TechnicalIndicators as TI
+from shared.indicators.multi_timeframe import MultiTimeframeTrend
 from strategies import register_strategy
 
 
@@ -50,6 +51,12 @@ class MeanReversionConfig:
     bb_std: float = 2.0
     use_bb_confirm: bool = True
     stop_loss_pct: float = 0.03
+    use_adx_filter: bool = True
+    adx_length: int = 14
+    adx_ranging_threshold: int = 25  # only enter when ADX < this (ranging market)
+    adx_trending_threshold: int = 30  # skip all entries when ADX > this (trending market)
+    use_mtf_filter: bool = True
+    htf_period: str = "1D"
 
 
 @register_strategy("mean_reversion")
@@ -64,6 +71,7 @@ class MeanReversionStrategy:
     def __init__(self, config: MeanReversionConfig | None = None) -> None:
         self.config = config or MeanReversionConfig()
         self._entry_prices: Dict[str, float] = {}
+        self._mtf = MultiTimeframeTrend(htf_period=self.config.htf_period)
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "MeanReversionStrategy":
@@ -96,6 +104,23 @@ class MeanReversionStrategy:
 
             current_pos = ctx.positions.get(sym, 0)
 
+            # ADX regime filter: only enter in ranging markets
+            adx_allows_entry = True
+            if cfg.use_adx_filter:
+                adx_val, _, _ = TI.adx(df, cfg.adx_length)
+                current_adx = float(adx_val.iloc[-1]) if not np.isnan(adx_val.iloc[-1]) else 20.0
+                if current_adx > cfg.adx_trending_threshold:
+                    adx_allows_entry = False  # trending market, skip mean reversion entries
+                elif current_adx > cfg.adx_ranging_threshold:
+                    adx_allows_entry = False  # borderline, still skip
+
+            # Multi-timeframe filter: only enter mean reversion when HTF is NEUTRAL (ranging)
+            mtf_allows_entry = True
+            if cfg.use_mtf_filter:
+                htf_trend = self._mtf.get_htf_trend(df)
+                if htf_trend in ("BULLISH", "BEARISH"):
+                    mtf_allows_entry = False  # strongly trending HTF, skip mean reversion
+
             # Stop loss check
             if current_pos != 0 and sym in self._entry_prices:
                 entry = self._entry_prices[sym]
@@ -123,7 +148,9 @@ class MeanReversionStrategy:
                 bb_long_ok = current_close <= bb_lower if cfg.use_bb_confirm else True
                 bb_short_ok = current_close >= bb_upper if cfg.use_bb_confirm else True
 
-                if current_rsi < cfg.rsi_oversold and bb_long_ok:
+                if not adx_allows_entry or not mtf_allows_entry:
+                    signals[sym] = 0
+                elif current_rsi < cfg.rsi_oversold and bb_long_ok:
                     signals[sym] = 1
                     self._entry_prices[sym] = current_close
                 elif current_rsi > cfg.rsi_overbought and bb_short_ok:

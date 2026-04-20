@@ -112,6 +112,16 @@ class RiskAnalyzer:
         returns = returns.dropna()
         if len(returns) < 30:
             logger.warning("Insufficient data for VaR: %d returns", len(returns))
+            return VaRResult(
+                confidence=confidence,
+                var_dollar=0.0,
+                var_pct=0.0,
+                method=method,
+                holding_period_days=holding_period,
+                portfolio_value=portfolio_value,
+                cvar_dollar=0.0,
+                cvar_pct=0.0,
+            )
 
         if method == "historical":
             var_pct = -np.percentile(returns, (1 - confidence) * 100)
@@ -121,7 +131,13 @@ class RiskAnalyzer:
             cvar_pct = -tail.mean() if len(tail) > 0 else var_pct
 
         elif method == "parametric":
-            from scipy.stats import norm
+            try:
+                from scipy.stats import norm
+            except ImportError:
+                raise ImportError(
+                    "scipy is required for parametric VaR. "
+                    "Install with: pip install scipy"
+                )
             mu = returns.mean()
             sigma = returns.std()
             z_score = norm.ppf(1 - confidence)

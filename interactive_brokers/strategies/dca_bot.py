@@ -52,6 +52,9 @@ class DCAConfig:
     symbols: List[str] = field(default_factory=lambda: ["SPY", "QQQ"])
     equal_split: bool = True  # split dollar_amount equally among symbols
 
+    # Fractional shares
+    allow_fractional: bool = False
+
     # Regime-aware pausing
     enable_regime_pause: bool = True
     rsi_overbought_threshold: float = 75.0
@@ -127,9 +130,9 @@ class DCABot:
         self.notifier = notifier
         self.config = config or DCAConfig()
 
-        if symbols:
+        if symbols is not None:
             self.config.symbols = symbols
-        if dollar_amount:
+        if dollar_amount is not None:
             self.config.dollar_amount = dollar_amount
 
         self._positions: Dict[str, DCAPosition] = {
@@ -156,9 +159,11 @@ class DCABot:
         close = df["close"]
         reasons = []
 
-        # Weekly RSI check (using daily close with weekly period)
-        weekly_close = close.resample("W").last().dropna() if hasattr(close.index, "freq") else close
-        rsi = self._calculate_rsi(close, self.config.rsi_length)
+        # Weekly RSI check
+        if not isinstance(close.index, pd.DatetimeIndex):
+            return False, "Cannot compute weekly RSI without DatetimeIndex"
+        weekly_close = close.resample("W").last().dropna()
+        rsi = self._calculate_rsi(weekly_close, self.config.rsi_length)
 
         if len(rsi) > 0:
             current_rsi = rsi.iloc[-1]
@@ -191,7 +196,9 @@ class DCABot:
         avg_loss = loss.ewm(alpha=1.0 / length, min_periods=length).mean()
 
         rs = avg_gain / avg_loss.replace(0, np.nan)
-        return 100 - (100 / (1 + rs))
+        rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.fillna(100.0)
+        return rsi
 
     # ─── Buy Execution ───
 
@@ -274,7 +281,32 @@ class DCABot:
             raise ValueError(f"No price data for {symbol}")
 
         current_price = df["close"].iloc[-1]
-        quantity = max(1, int(dollar_amount / current_price))
+
+        if self.config.allow_fractional:
+            quantity = round(dollar_amount / current_price, 4)
+            if quantity <= 0:
+                logger.warning("Fractional qty %.4f <= 0 for %s", quantity, symbol)
+                return {
+                    "symbol": symbol,
+                    "status": "skipped",
+                    "reason": f"Computed fractional qty {quantity} <= 0",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            logger.info(
+                "DCA fractional: buying %.4f shares of %s @ $%.2f",
+                quantity, symbol, current_price,
+            )
+        else:
+            if current_price > dollar_amount:
+                logger.warning("Price %.2f exceeds budget %.2f", current_price, dollar_amount)
+                return {
+                    "symbol": symbol,
+                    "status": "skipped",
+                    "reason": f"Price {current_price} exceeds budget {dollar_amount}",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            quantity = max(1, int(dollar_amount / current_price))
+
         total_cost = quantity * current_price
 
         # Risk manager check

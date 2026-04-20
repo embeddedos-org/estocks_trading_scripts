@@ -68,13 +68,16 @@ class FamaFrenchFactors:
         winners = mom_12_1.gt(median_mom, axis=0)
         factors["MOM"] = returns.where(winners).mean(axis=1) - returns.where(~winners).mean(axis=1)
 
-        # Quality - low volatility as quality proxy
+        # Quality - rolling Sharpe ratio as quality proxy
+        rolling_mean = returns.rolling(252).mean()
+        rolling_std = returns.rolling(252).std()
+        quality = rolling_mean / rolling_std.replace(0, np.nan)
+        factors["Quality"] = quality.mean(axis=1)
+
+        # LowVol factor
         vol_60 = returns.rolling(60).std()
         median_vol = vol_60.median(axis=1)
         low_vol = vol_60.lt(median_vol, axis=0)
-        factors["Quality"] = returns.where(low_vol).mean(axis=1) - returns.where(~low_vol).mean(axis=1)
-
-        # LowVol factor
         factors["LowVol"] = returns.where(low_vol).mean(axis=1) - returns.where(~low_vol).mean(axis=1)
 
         return factors.dropna()
@@ -167,13 +170,25 @@ class FactorBacktester:
             if idx % rebalance_freq != 0 or idx < 252:
                 return {t: 0 for t in tickers}
 
-            # Rank by momentum
+            # Rank by selected factor
             current_prices = {}
             for t in tickers:
                 if t in ctx.bars and len(ctx.bars[t]) > 252:
                     p = ctx.bars[t]["close"]
-                    mom = p.iloc[-21] / p.iloc[-252] - 1
-                    current_prices[t] = mom
+                    if factor_name == "MOM":
+                        score = p.iloc[-21] / p.iloc[-252] - 1
+                    elif factor_name == "LowVol":
+                        score = -p.pct_change().tail(60).std()
+                    elif factor_name == "HML":
+                        high_52w = p.rolling(252).max().iloc[-1]
+                        score = -(p.iloc[-1] / high_52w) if high_52w > 0 else 0
+                    elif factor_name == "Quality":
+                        ret = p.pct_change()
+                        std = ret.tail(252).std()
+                        score = ret.tail(252).mean() / std if std > 0 else 0
+                    else:
+                        score = p.iloc[-21] / p.iloc[-252] - 1
+                    current_prices[t] = score
 
             if len(current_prices) < n_long + n_short:
                 return {t: 0 for t in tickers}
@@ -199,4 +214,5 @@ class FactorBacktester:
             df["low"] = df["close"]
             df["volume"] = 1_000_000
 
-        return engine.run(strategy_fn, data)
+        engine.load_data(data)
+        return engine.run(strategy_fn)

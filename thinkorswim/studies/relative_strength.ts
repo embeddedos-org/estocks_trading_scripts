@@ -19,12 +19,12 @@ def rawRS = if refClose != 0 then close / refClose else 0;
 # --- Mansfield Relative Strength ---
 # Mansfield RS = ((RS / SMA(RS, period)) - 1) * 100
 def maLengthBars = maLength * dailyBarsPerWeek;
-def rsMA = SimpleMovingAvg(rawRS, maLengthBars);
+def rsMA = MovingAverage(averageType, rawRS, maLengthBars);
 def mansfieldRS = if rsMA != 0 then ((rawRS / rsMA) - 1) * 100 else 0;
 
 # --- RS Moving Average ---
 def rsSmoothLength = Round(maLengthBars / 4, 0);
-def rsSmoothed = SimpleMovingAvg(mansfieldRS, rsSmoothLength);
+def rsSmoothed = MovingAverage(averageType, mansfieldRS, rsSmoothLength);
 
 # --- Plots ---
 plot RSLine = mansfieldRS;

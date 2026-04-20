@@ -44,6 +44,9 @@ class LSTMConfig:
     use_gru: bool = False
     target: str = "return"
     device: str = "auto"
+    patience: int = 5  # early stopping patience
+    lr_scheduler_patience: int = 3  # ReduceLROnPlateau patience
+    lr_scheduler_factor: float = 0.5  # LR reduction factor
 
 
 if _HAS_TORCH:
@@ -119,6 +122,11 @@ class LSTMPredictor:
         self.model = _LSTMModel(X.shape[2], self.config).to(self.device)
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config.learning_rate)
         criterion = nn.MSELoss()
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            patience=self.config.lr_scheduler_patience,
+            factor=self.config.lr_scheduler_factor,
+        )
 
         train_ds = TensorDataset(
             torch.FloatTensor(splits["X_train"]),
@@ -127,6 +135,8 @@ class LSTMPredictor:
         train_loader = DataLoader(train_ds, batch_size=self.config.batch_size, shuffle=True)
 
         best_val_loss = float("inf")
+        best_state_dict = None
+        patience_counter = 0
         for epoch in range(self.config.epochs):
             self.model.train()
             train_losses = []
@@ -148,12 +158,26 @@ class LSTMPredictor:
                 val_pred = self.model(val_x)
                 val_loss = criterion(val_pred, val_y).item()
 
+            scheduler.step(val_loss)
+
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
+                best_state_dict = {k: v.clone() for k, v in self.model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.config.patience:
+                    logger.info("Early stopping at epoch %d (patience=%d)",
+                               epoch + 1, self.config.patience)
+                    break
 
             if (epoch + 1) % 10 == 0:
                 logger.info("Epoch %d/%d - train_loss: %.6f, val_loss: %.6f",
                            epoch + 1, self.config.epochs, np.mean(train_losses), val_loss)
+
+        # Restore best model weights
+        if best_state_dict is not None:
+            self.model.load_state_dict(best_state_dict)
 
         return {"train_loss": np.mean(train_losses), "val_loss": best_val_loss}
 
@@ -248,7 +272,8 @@ class LSTMPredictor:
 
         engine = BacktestEngineV2()
         symbol = "STOCK"
-        return engine.run(strategy_fn, {symbol: test_df})
+        engine.load_data({symbol: test_df})
+        return engine.run(strategy_fn)
 
     def save_model(self, path: str) -> None:
         """Save model weights and config."""
@@ -265,7 +290,7 @@ class LSTMPredictor:
 
     def load_model(self, path: str) -> None:
         """Load model weights and config."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.config = checkpoint["config"]
         self.feature_cols = checkpoint["feature_cols"]
         self._scaler_mean = checkpoint["scaler_mean"]

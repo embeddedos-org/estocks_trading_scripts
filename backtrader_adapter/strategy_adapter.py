@@ -15,9 +15,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
 
-import numpy as np
-import pandas as pd
-
 logger = logging.getLogger(__name__)
 
 try:
@@ -76,12 +73,6 @@ if _HAS_BT:
             self.trade_log: List[Dict[str, Any]] = []
             self._bar_count = 0
 
-            # Pre-compute indicators if TechnicalIndicators available
-            try:
-                from shared.indicators.technical_indicators import TechnicalIndicators as TI
-                self._ti = TI
-            except ImportError:
-                self._ti = None
 
         def next(self):
             self._bar_count += 1

@@ -17,9 +17,9 @@ if PROJECT_ROOT not in sys.path:
 
 @pytest.fixture
 def synthetic_ohlcv_df() -> pd.DataFrame:
-    """200-bar synthetic OHLCV DataFrame for single-symbol strategy tests."""
+    """400-bar synthetic OHLCV DataFrame for single-symbol strategy tests."""
     rng = np.random.RandomState(42)
-    n_bars = 200
+    n_bars = 400
     dates = pd.bdate_range("2022-01-01", periods=n_bars)
     price = 100.0
     rows = []

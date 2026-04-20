@@ -39,6 +39,7 @@ from shared.backtesting.backtest_engine_v2 import (
     BacktestResultV2,
 )
 from shared.indicators.technical_indicators import TechnicalIndicators as TI
+from shared.indicators.multi_timeframe import MultiTimeframeTrend
 from strategies import register_strategy
 
 
@@ -50,6 +51,8 @@ class BreakoutConfig:
     volume_mult: float = 1.5
     atr_stop_mult: float = 2.0
     confirm_bars: int = 1
+    use_mtf_filter: bool = True
+    htf_period: str = "1D"
 
 
 @register_strategy("breakout")
@@ -65,6 +68,7 @@ class BreakoutStrategy:
         self.config = config or BreakoutConfig()
         self._trailing_stops: Dict[str, float] = {}
         self._breakout_bars: Dict[str, int] = {}  # bars since breakout signal
+        self._mtf = MultiTimeframeTrend(htf_period=self.config.htf_period)
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "BreakoutStrategy":
@@ -127,10 +131,17 @@ class BreakoutStrategy:
                     self._breakout_bars.pop(sym, None)
                     continue
 
+            # Multi-timeframe trend filter: only take breakouts aligned with HTF
+            mtf_buy_ok = True
+            mtf_sell_ok = True
+            if cfg.use_mtf_filter:
+                mtf_buy_ok = self._mtf.is_aligned(df, "BUY")
+                mtf_sell_ok = self._mtf.is_aligned(df, "SELL")
+
             # Entry logic with confirmation bars
             if current_pos == 0:
                 # Long breakout
-                if current_close > dc_upper and volume_spike:
+                if current_close > dc_upper and volume_spike and mtf_buy_ok:
                     bars_above = self._breakout_bars.get(sym, 0) + 1
                     self._breakout_bars[sym] = bars_above
                     if bars_above >= cfg.confirm_bars:
@@ -140,7 +151,7 @@ class BreakoutStrategy:
                     else:
                         signals[sym] = 0
                 # Short breakout
-                elif current_close < dc_lower and volume_spike:
+                elif current_close < dc_lower and volume_spike and mtf_sell_ok:
                     bars_below = self._breakout_bars.get(sym, 0) + 1
                     self._breakout_bars[sym] = bars_below
                     if bars_below >= cfg.confirm_bars:

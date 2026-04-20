@@ -6,6 +6,7 @@ Environment variables always take precedence over YAML values.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, TypedDict
@@ -152,8 +153,10 @@ def _apply_env_overlay(cfg: dict) -> None:
             if raw is not None and raw != "":
                 try:
                     _deep_set(cfg, dotted_path, field_name, cast_type(raw))
-                except (ValueError, TypeError):
-                    pass
+                except (ValueError, TypeError) as e:
+                    logging.getLogger(__name__).warning(
+                        "Failed to cast env var %s=%s: %s", env_var, raw, e
+                    )
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
@@ -182,4 +185,63 @@ def load_config(path: str | Path | None = None) -> AppConfig:
 
     _apply_env_overlay(cfg)
 
+    # FIX 12: Validate config schema
+    _validate_config(cfg)
+
     return cfg  # type: ignore[return-value]
+
+
+# ─── FIX 12: Config Schema Validation ───
+
+_REQUIRED_KEYS = {
+    "brokers": "Broker configuration is required (ib, tradestation, or schwab)",
+}
+
+_KNOWN_TOP_KEYS = {
+    "brokers", "notifications", "strategies", "webhook",
+    "symbols", "risk_management", "logging", "server",
+    "health_monitor", "broker_configs", "broker_routing",
+    "security", "rate_limiting",
+}
+
+
+def _validate_config(config: dict) -> None:
+    """Validate loaded config for required keys and warn on unknowns.
+
+    Args:
+        config: The loaded configuration dictionary.
+    """
+    log = logging.getLogger(__name__)
+
+    # Check required keys
+    for key, message in _REQUIRED_KEYS.items():
+        if key not in config:
+            log.warning("Config validation: missing required key '%s' — %s", key, message)
+
+    # Warn on unknown top-level keys (possible typos)
+    for key in config:
+        if key not in _KNOWN_TOP_KEYS:
+            log.warning(
+                "Config validation: unknown top-level key '%s' — possible typo? "
+                "Known keys: %s",
+                key, ", ".join(sorted(_KNOWN_TOP_KEYS)),
+            )
+
+    # Validate IB port matches mode if both are specified
+    ib_config = config.get("brokers", {}).get("ib", {})
+    if ib_config:
+        port = ib_config.get("port")
+        mode = ib_config.get("mode", "")
+        if port and mode:
+            if mode == "paper" and port not in (7497, 4002):
+                log.warning(
+                    "Config validation: IB mode='paper' but port=%d "
+                    "(expected 7497 or 4002)",
+                    port,
+                )
+            elif mode == "live" and port not in (7496, 4001):
+                log.warning(
+                    "Config validation: IB mode='live' but port=%d "
+                    "(expected 7496 or 4001)",
+                    port,
+                )

@@ -76,6 +76,14 @@ class RegimeFreqtradeStrategy(StocksPluginStrategy):
         """
         dataframe = super().populate_indicators(dataframe, metadata)
 
+        if "atr" not in dataframe.columns or "adx" not in dataframe.columns:
+            logger.warning(
+                "Parent indicator columns 'atr'/'adx' missing for %s — skipping regime classification",
+                metadata.get("pair", "?"),
+            )
+            dataframe["regime"] = 1
+            return dataframe
+
         dataframe["atr_avg"] = dataframe["atr"].rolling(window=self.atr_avg_window).mean()
 
         dataframe["regime"] = 1  # default RANGING

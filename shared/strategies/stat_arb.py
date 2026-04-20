@@ -248,4 +248,5 @@ class BasketTrader:
             data[t] = df
 
         engine = BacktestEngineV2()
-        return engine.run(strategy_fn, data)
+        engine.load_data(data)
+        return engine.run(strategy_fn)

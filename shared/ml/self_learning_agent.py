@@ -124,8 +124,25 @@ class SelfLearningAgent:
         self._last_weight_update = 0
         self._pending_trade: Optional[Dict[str, Any]] = None
         self._current_regime = "UNKNOWN"
+        self._last_retrain_time: float = 0.0  # epoch timestamp of last retrain
+        self._retrain_cooldown_secs: float = 3600.0  # 1 hour cooldown
+        self._training_data: Optional[pd.DataFrame] = None  # cached for auto-retrain
+        self._data_fetcher = None  # GAP #1: set via set_data_fetcher() for fresh retrain data
+        self._symbols: List[str] = []  # symbols being monitored
 
         logger.info("SelfLearningAgent initialized (memory: %s)", self._memory)
+
+    def set_data_fetcher(self, fetcher, symbols: Optional[List[str]] = None) -> None:
+        """Set a data fetcher for fresh data during auto-retrain.
+
+        Args:
+            fetcher: Object with fetch_ohlcv_history(symbol, period) method.
+            symbols: List of symbols to use for retraining.
+        """
+        self._data_fetcher = fetcher
+        if symbols:
+            self._symbols = symbols
+        logger.info("Data fetcher set for auto-retrain (symbols=%s)", self._symbols)
 
     # ─── Training ───
 
@@ -221,6 +238,7 @@ class SelfLearningAgent:
                 results["rl"] = {"status": "skipped", "reason": "stable-baselines3 not installed"}
 
         self._models_trained = True
+        self._training_data = df  # cache for auto-retrain
         if verbose:
             active = [k for k, v in results.items() if v.get("status") != "skipped"]
             print(f"\n  [Agent] Training complete. Active models: {active}")
@@ -567,7 +585,11 @@ class SelfLearningAgent:
         return action
 
     def _check_retrain_needed(self) -> None:
-        """Check if any models need retraining based on degrading accuracy."""
+        """Check if any models need retraining based on degrading accuracy.
+
+        If degradation is detected and auto-retrain is enabled, triggers
+        retraining with a cooldown to prevent excessive retraining.
+        """
         trade_count = self._memory.get_trade_count()
         if trade_count < 20:
             return
@@ -578,18 +600,81 @@ class SelfLearningAgent:
         for model_name, stats in accuracies.items():
             if stats.get("needs_retrain", False):
                 models_needing_retrain.append(model_name)
+                acc = stats.get("accuracy", 0)
                 logger.warning(
                     "Model '%s' needs retraining: accuracy=%.2f%%, trend=%+.2f",
                     model_name,
-                    stats.get("accuracy", 0) * 100,
+                    acc * 100,
                     stats.get("trend", 0),
                 )
 
         if models_needing_retrain:
-            logger.warning(
-                "RETRAIN RECOMMENDED for: %s (call agent.train(df, models=%s))",
-                models_needing_retrain, models_needing_retrain,
-            )
+            current_time = time.time()
+            time_since_last = current_time - self._last_retrain_time
+
+            if (
+                self.config.retrain_on_degradation
+                and (self._training_data is not None or self._data_fetcher is not None)
+                and time_since_last >= self._retrain_cooldown_secs
+            ):
+                # Auto-retrain degraded models
+                for model_name in models_needing_retrain:
+                    acc = accuracies[model_name].get("accuracy", 0)
+                    thresh = self.config.min_accuracy_threshold
+                    logger.info(
+                        "Auto-retraining triggered: accuracy %.2f%% below threshold %.2f%%",
+                        acc * 100, thresh * 100,
+                    )
+                try:
+                    # GAP #1: Fetch FRESH data instead of using stale cached data
+                    train_df = self._training_data
+                    if self._data_fetcher and self._symbols:
+                        try:
+                            fresh_df = self._data_fetcher.fetch_ohlcv(
+                                self._symbols[0], period="2y", interval="1d",
+                            )
+                            if fresh_df is not None and len(fresh_df) > 200:
+                                train_df = fresh_df
+                                logger.info(
+                                    "Auto-retrain using FRESH data: %d bars of %s",
+                                    len(fresh_df), self._symbols[0],
+                                )
+                            else:
+                                logger.warning(
+                                    "Fresh data insufficient (%d bars), falling back to cached",
+                                    len(fresh_df) if fresh_df is not None else 0,
+                                )
+                        except Exception as fetch_err:
+                            logger.warning(
+                                "Fresh data fetch failed: %s. Using cached data.", fetch_err,
+                            )
+
+                    if train_df is None:
+                        logger.warning("No training data available for retrain")
+                    else:
+                        self.train(
+                            train_df,
+                            models=models_needing_retrain,
+                            verbose=False,
+                        )
+                    self._last_retrain_time = current_time
+                    logger.info(
+                        "Auto-retrain complete for models: %s",
+                        models_needing_retrain,
+                    )
+                except Exception as e:
+                    logger.error("Auto-retrain failed: %s", e)
+            elif time_since_last < self._retrain_cooldown_secs:
+                remaining = self._retrain_cooldown_secs - time_since_last
+                logger.info(
+                    "Retrain cooldown active: %.0fs remaining",
+                    remaining,
+                )
+            else:
+                logger.warning(
+                    "RETRAIN RECOMMENDED for: %s (call agent.train(df, models=%s))",
+                    models_needing_retrain, models_needing_retrain,
+                )
 
     def _build_reasoning(
         self,

@@ -27,12 +27,17 @@ Usage:
 
 from __future__ import annotations
 
+import glob
 import logging
+import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+
+from shared.risk_manager_unified import UnifiedPortfolioRiskGate
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +53,21 @@ class Position:
     current_price: float = 0.0
     unrealized_pnl: float = 0.0
     order_id: Optional[str] = None
+    max_holding_bars: int = 0
+    bars_held: int = 0
+
+
+@dataclass
+class TrailingStop:
+    """Trailing stop configuration for a position."""
+    symbol: str
+    direction: str  # "long" or "short"
+    activation_pct: float  # e.g., 0.02 = activate after 2% profit
+    trail_pct: float  # e.g., 0.015 = trail by 1.5%
+    highest_price: float = 0.0
+    lowest_price: float = float('inf')
+    activated: bool = False
+    stop_price: float = 0.0
 
 
 @dataclass
@@ -62,6 +82,46 @@ class ExecutionResult:
     order_id: str = ""
     message: str = ""
     timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    fill_price: Optional[float] = None
+    filled_quantity: Optional[int] = None
+
+
+# ─── Commission Model
+#
+# The CommissionModel provides a unified way to estimate trading commissions
+# across all supported brokers.  The default values reflect typical US equity
+# commission schedules (similar to Interactive Brokers tiered pricing):
+#
+#   per_share   — charge per share traded (default $0.005)
+#   min_per_order — minimum commission per order (default $1.00)
+#   max_pct     — cap as a fraction of trade value (default 0.5%)
+#
+# Formula:  commission = max(min_per_order,
+#                            min(shares * per_share,
+#                                shares * price * max_pct))
+#
+# Brokers with different fee structures can override per_share / min /
+# max_pct when constructing BrokerBridge.  The commission is subtracted
+# from realized P&L on every position close.
+
+@dataclass
+class CommissionModel:
+    """Configurable per-trade commission estimator."""
+    per_share: float = 0.005
+    min_per_order: float = 1.0
+    max_pct: float = 0.005
+
+    def calculate_commission(self, shares: int, price: float) -> float:
+        """Estimate the commission for a trade.
+
+        Returns:
+            Commission in dollars (always >= 0).
+        """
+        if shares <= 0 or price <= 0:
+            return 0.0
+        raw = shares * self.per_share
+        cap = shares * price * self.max_pct
+        return max(self.min_per_order, min(raw, cap))
 
 
 class BaseBrokerAdapter(ABC):
@@ -81,6 +141,15 @@ class BaseBrokerAdapter(ABC):
 
     @abstractmethod
     def place_limit_order(self, symbol: str, action: str, quantity: int, price: float) -> ExecutionResult: ...
+
+    def place_stop_order(self, symbol: str, action: str, quantity: int, stop_price: float) -> ExecutionResult:
+        """Place a stop order. Default falls back to limit order if not overridden."""
+        logger.warning(
+            "place_stop_order() not implemented for %s — falling back to limit order. "
+            "This may NOT execute as a true stop order!",
+            getattr(self, '_name', 'unknown'),
+        )
+        return self.place_limit_order(symbol, action, quantity, stop_price)
 
     @abstractmethod
     def cancel_order(self, order_id: str) -> bool: ...
@@ -225,6 +294,20 @@ class IBAdapter(BaseBrokerAdapter):
         except Exception as e:
             return ExecutionResult(False, self.name, symbol, action, quantity, price, message=str(e))
 
+    def place_stop_order(self, symbol: str, action: str, quantity: int, stop_price: float) -> ExecutionResult:
+        """Place a native IB stop order via ib_async."""
+        if not self._order_manager:
+            return ExecutionResult(False, self.name, symbol, action, quantity, stop_price, message="Not connected")
+        try:
+            trade = self._order_manager.stop_order(symbol, action.upper(), float(quantity), stop_price)
+            order_id = str(trade.order.orderId) if hasattr(trade, 'order') else str(id(trade))
+            logger.info("IB stop order: %s %d %s @ $%.2f → %s", action, quantity, symbol, stop_price, order_id)
+            return ExecutionResult(True, self.name, symbol, action, quantity, stop_price, order_id=order_id,
+                                   message=f"Stop order: {action} {quantity} {symbol} @ ${stop_price:.2f}")
+        except Exception as e:
+            logger.warning("IB native stop order failed, falling back to limit: %s", e)
+            return self.place_limit_order(symbol, action, quantity, stop_price)
+
     def cancel_order(self, order_id: str) -> bool:
         if self._order_manager:
             return self._order_manager.cancel_order(int(order_id))
@@ -337,10 +420,23 @@ class TradeStationAdapter(BaseBrokerAdapter):
         except Exception as e:
             return ExecutionResult(False, self.name, symbol, action, quantity, price, message=str(e))
 
+    def place_stop_order(self, symbol: str, action: str, quantity: int, stop_price: float) -> ExecutionResult:
+        """Place a native TradeStation StopMarket order."""
+        if not self._router:
+            return ExecutionResult(False, self.name, symbol, action, quantity, stop_price, message="Not connected")
+        try:
+            order_id = self._router.place_stop_order(self._account_id, symbol, action.upper(), quantity, stop_price)
+            return ExecutionResult(True, self.name, symbol, action, quantity, stop_price, order_id=order_id,
+                                   message=f"TS stop order: {action} {quantity} {symbol} @ ${stop_price:.2f}")
+        except Exception as e:
+            logger.warning("TradeStation native stop order failed, falling back to limit: %s", e)
+            return self.place_limit_order(symbol, action, quantity, stop_price)
+
     def cancel_order(self, order_id: str) -> bool:
+        # FIX 14: Match order_router.cancel_order(order_id) signature (no account_id)
         if self._router:
             try:
-                self._router.cancel_order(self._account_id, order_id)
+                self._router.cancel_order(order_id)
                 return True
             except Exception:
                 return False
@@ -373,8 +469,8 @@ class TradeStationAdapter(BaseBrokerAdapter):
         try:
             quote = self._router.get_quote(symbol)
             # TradeStation v3 quote fields: Last, Ask, Bid, Close
-            for field in ("Last", "Ask", "Bid", "Close"):
-                val = quote.get(field)
+            for field_name in ("Last", "Ask", "Bid", "Close"):
+                val = quote.get(field_name)
                 if val is not None:
                     price = float(val)
                     if price > 0:
@@ -433,6 +529,18 @@ class SchwabAdapter(BaseBrokerAdapter):
             return ExecutionResult(True, self.name, symbol, action, quantity, price, order_id=order_id)
         except Exception as e:
             return ExecutionResult(False, self.name, symbol, action, quantity, price, message=str(e))
+
+    def place_stop_order(self, symbol: str, action: str, quantity: int, stop_price: float) -> ExecutionResult:
+        """Place a native Schwab STOP order with stopPrice."""
+        if not self._client:
+            return ExecutionResult(False, self.name, symbol, action, quantity, stop_price, message="Not connected")
+        try:
+            order_id = self._client.place_stop_order(symbol, action.upper(), quantity, stop_price)
+            return ExecutionResult(True, self.name, symbol, action, quantity, stop_price, order_id=order_id,
+                                   message=f"Schwab stop order: {action} {quantity} {symbol} @ ${stop_price:.2f}")
+        except Exception as e:
+            logger.warning("Schwab native stop order failed, falling back to limit: %s", e)
+            return self.place_limit_order(symbol, action, quantity, stop_price)
 
     def cancel_order(self, order_id: str) -> bool:
         if self._client:
@@ -519,6 +627,8 @@ class BrokerBridge:
         default_tp_pct: float = 3.0,
         default_sl_pct: float = 2.0,
         diary_path: Optional[str] = None,
+        commission: Optional[CommissionModel] = None,
+        max_holding_bars: int = 240,
     ) -> None:
         self._broker_name = broker.lower()
         self._config = config or {}
@@ -529,6 +639,8 @@ class BrokerBridge:
         self._max_loss_pct = max_loss_pct
         self._default_tp_pct = default_tp_pct
         self._default_sl_pct = default_sl_pct
+        self._commission = commission or CommissionModel()
+        self._max_holding_bars = max_holding_bars
 
         # Diary path
         if diary_path is None:
@@ -541,6 +653,20 @@ class BrokerBridge:
 
         # Position tracking
         self._positions: Dict[str, Position] = {}
+        # FIX 2: Threading lock for position state
+        self._position_lock = threading.Lock()
+
+        # OCO pair tracking: maps order_id -> paired order_id
+        self._oco_pairs: Dict[str, str] = {}
+
+        # Trailing stops
+        self._trailing_stops: Dict[str, TrailingStop] = {}
+
+        # Optional RiskManager (set externally)
+        self._risk_manager: Optional[Any] = None
+
+        # Unified portfolio risk gate (cross-strategy coordination)
+        self._portfolio_gate = UnifiedPortfolioRiskGate.get_instance()
 
         # Create adapter
         self._adapter = self._create_adapter()
@@ -620,8 +746,9 @@ class BrokerBridge:
             logger.debug("Decision: HOLD %s (confidence=%.2f)", symbol, confidence)
             return None
 
-        has_position = symbol in self._positions
-        current_pos = self._positions.get(symbol)
+        with self._position_lock:
+            has_position = symbol in self._positions
+            current_pos = self._positions.get(symbol)
 
         if action == "BUY":
             if has_position and current_pos.direction == "long":
@@ -632,25 +759,52 @@ class BrokerBridge:
                 self._close_position(symbol, price, agent)
 
             shares = self._calculate_shares(price)
+            notional = shares * price if price > 0 else 0
+
+            gate_ok, gate_reason = self._portfolio_gate.can_open_position(symbol, notional)
+            if not gate_ok:
+                logger.warning(
+                    "Portfolio risk gate BLOCKED BUY %s ($%.0f): %s",
+                    symbol, notional, gate_reason,
+                )
+                return ExecutionResult(
+                    False, self._adapter.name, symbol, action, shares, price,
+                    message=f"Portfolio risk gate blocked: {gate_reason}",
+                )
+
             result = self._adapter.place_market_order(symbol, "BUY", shares)
 
             if result.success:
-                self._positions[symbol] = Position(
-                    symbol=symbol, direction="long", shares=shares,
-                    entry_price=price, entry_time=datetime.now().isoformat(),
-                    order_id=result.order_id,
-                )
-                logger.info("📈 OPENED LONG: %d shares %s @ $%.2f [%s]",
-                           shares, symbol, price, self._adapter.name)
+                actual_price = getattr(result, 'fill_price', None) or price
+                filled = getattr(result, 'filled_quantity', None) or shares
+                if filled == 0:
+                    logger.error("Order filled 0 shares for %s — not opening position", symbol)
+                    return result
+                if filled < shares:
+                    logger.warning("Partial fill: requested %d, filled %d for %s", shares, filled, symbol)
 
-                # Auto-place TP/SL
-                self._place_tp_sl(symbol, price, "long", tp_price, sl_price)
+                with self._position_lock:
+                    self._positions[symbol] = Position(
+                        symbol=symbol, direction="long", shares=filled,
+                        entry_price=actual_price, entry_time=datetime.now().isoformat(),
+                        order_id=result.order_id,
+                        max_holding_bars=self._max_holding_bars,
+                    )
+                logger.info("📈 OPENED LONG: %d shares %s @ $%.2f [%s]",
+                           filled, symbol, actual_price, self._adapter.name)
+
+                self._portfolio_gate.register_position(
+                    symbol, filled, actual_price, "agent", self._adapter.name,
+                )
+
+                self._place_tp_sl(symbol, actual_price, "long", tp_price, sl_price, filled)
 
                 self._write_diary({
                     "action": "OPEN_LONG",
                     "symbol": symbol,
-                    "shares": shares,
-                    "entry_price": price,
+                    "shares": filled,
+                    "entry_price": actual_price,
+                    "decision_price": price,
                     "tp_price": tp_price,
                     "sl_price": sl_price,
                     "order_id": result.order_id,
@@ -667,24 +821,52 @@ class BrokerBridge:
                 return None
 
             shares = self._calculate_shares(price)
+            notional = shares * price if price > 0 else 0
+
+            gate_ok, gate_reason = self._portfolio_gate.can_open_position(symbol, notional)
+            if not gate_ok:
+                logger.warning(
+                    "Portfolio risk gate BLOCKED SELL %s ($%.0f): %s",
+                    symbol, notional, gate_reason,
+                )
+                return ExecutionResult(
+                    False, self._adapter.name, symbol, action, shares, price,
+                    message=f"Portfolio risk gate blocked: {gate_reason}",
+                )
+
             result = self._adapter.place_market_order(symbol, "SELL", shares)
 
             if result.success:
-                self._positions[symbol] = Position(
-                    symbol=symbol, direction="short", shares=shares,
-                    entry_price=price, entry_time=datetime.now().isoformat(),
-                    order_id=result.order_id,
-                )
-                logger.info("📉 OPENED SHORT: %d shares %s @ $%.2f [%s]",
-                           shares, symbol, price, self._adapter.name)
+                actual_price = getattr(result, 'fill_price', None) or price
+                filled = getattr(result, 'filled_quantity', None) or shares
+                if filled == 0:
+                    logger.error("Order filled 0 shares for %s — not opening position", symbol)
+                    return result
+                if filled < shares:
+                    logger.warning("Partial fill: requested %d, filled %d for %s", shares, filled, symbol)
 
-                self._place_tp_sl(symbol, price, "short", tp_price, sl_price)
+                with self._position_lock:
+                    self._positions[symbol] = Position(
+                        symbol=symbol, direction="short", shares=filled,
+                        entry_price=actual_price, entry_time=datetime.now().isoformat(),
+                        order_id=result.order_id,
+                        max_holding_bars=self._max_holding_bars,
+                    )
+                logger.info("📉 OPENED SHORT: %d shares %s @ $%.2f [%s]",
+                           filled, symbol, actual_price, self._adapter.name)
+
+                self._portfolio_gate.register_position(
+                    symbol, filled, actual_price, "agent", self._adapter.name,
+                )
+
+                self._place_tp_sl(symbol, actual_price, "short", tp_price, sl_price, filled)
 
                 self._write_diary({
                     "action": "OPEN_SHORT",
                     "symbol": symbol,
-                    "shares": shares,
-                    "entry_price": price,
+                    "shares": filled,
+                    "entry_price": actual_price,
+                    "decision_price": price,
                     "tp_price": tp_price,
                     "sl_price": sl_price,
                     "order_id": result.order_id,
@@ -701,7 +883,8 @@ class BrokerBridge:
         agent: Optional[Any] = None,
     ) -> ExecutionResult:
         """Close an existing position and record outcome."""
-        pos = self._positions.get(symbol)
+        with self._position_lock:
+            pos = self._positions.get(symbol)
         if not pos:
             return ExecutionResult(False, self._adapter.name, symbol, "CLOSE", 0, exit_price,
                                    message="No position to close")
@@ -710,38 +893,66 @@ class BrokerBridge:
         result = self._adapter.place_market_order(symbol, close_action, pos.shares)
 
         if result.success:
+            # FIX 1: Use fill price from close result, not decision price
+            actual_exit = getattr(result, 'fill_price', None) or exit_price
+
             # Calculate P&L
             if pos.direction == "long":
-                pnl = (exit_price - pos.entry_price) * pos.shares
+                raw_pnl = (actual_exit - pos.entry_price) * pos.shares
             else:
-                pnl = (pos.entry_price - exit_price) * pos.shares
+                raw_pnl = (pos.entry_price - actual_exit) * pos.shares
+
+            # Fix 4: deduct commissions from both entry and exit
+            entry_comm = self._commission.calculate_commission(pos.shares, pos.entry_price)
+            exit_comm = self._commission.calculate_commission(pos.shares, actual_exit)
+            pnl = raw_pnl - entry_comm - exit_comm
 
             emoji = "✅" if pnl > 0 else "❌"
             logger.info(
-                "%s CLOSED %s: %d shares %s | entry=$%.2f exit=$%.2f | P&L=$%.2f",
+                "%s CLOSED %s: %d shares %s | entry=$%.2f exit=$%.2f | "
+                "raw=$%.2f comm=$%.2f net=$%.2f",
                 emoji, pos.direction.upper(), pos.shares, symbol,
-                pos.entry_price, exit_price, pnl,
+                pos.entry_price, actual_exit, raw_pnl, entry_comm + exit_comm, pnl,
             )
 
             # Record outcome in agent memory
             if agent:
                 try:
                     agent.record_outcome(
-                        exit_price=exit_price,
+                        exit_price=actual_exit,
                         pnl=pnl,
-                        holding_period_bars=1,
+                        holding_period_bars=pos.bars_held or 1,
                     )
                 except Exception as e:
                     logger.warning("Failed to record outcome: %s", e)
 
-            del self._positions[symbol]
+            with self._position_lock:
+                self._positions.pop(symbol, None)
+
+            self._portfolio_gate.close_position(symbol, pnl)
 
         return result
 
-    def _calculate_shares(self, price: float) -> int:
-        """Calculate position size based on capital and limits."""
+    def _calculate_shares(self, price: float, stop_price: Optional[float] = None) -> int:
+        """Calculate position size based on capital and limits.
+
+        If a RiskManager is attached, delegates to its position sizing logic.
+        """
         if price <= 0:
             return 0
+
+        if self._risk_manager is not None:
+            try:
+                size_result = self._risk_manager.calculate_position_size(
+                    symbol="",
+                    entry_price=price,
+                    stop_price=stop_price,
+                )
+                rm_shares = size_result if isinstance(size_result, int) else getattr(size_result, 'shares', size_result)
+                return min(int(rm_shares), self._max_shares)
+            except Exception as e:
+                logger.warning("RiskManager sizing failed, falling back to default: %s", e)
+
         dollar_amount = self._capital * self._max_position_pct
         shares = int(dollar_amount / price)
         return min(shares, self._max_shares)
@@ -750,7 +961,8 @@ class BrokerBridge:
 
     def get_positions(self) -> Dict[str, Position]:
         """Get locally tracked positions."""
-        return dict(self._positions)
+        with self._position_lock:
+            return dict(self._positions)
 
     def get_broker_positions(self) -> List[Dict[str, Any]]:
         """Get positions directly from the broker."""
@@ -761,19 +973,67 @@ class BrokerBridge:
         return self._adapter.get_account_info()
 
     def get_latest_price(self, symbol: str) -> float:
-        """Get latest price from the broker."""
-        return self._adapter.get_latest_price(symbol)
+        """Get latest price from the broker.
+
+        .. warning::
+            Returns 0.0 when the price cannot be fetched.  Callers MUST
+            check ``price > 0`` before using the value in order sizing,
+            P&L calculations, or order placement to avoid $0 trades.
+        """
+        price = self._adapter.get_latest_price(symbol)
+        if price <= 0:
+            logger.warning("get_latest_price(%s) returned 0.0 — callers must guard", symbol)
+        return price
 
     def close_all_positions(self, agent: Optional[Any] = None) -> List[ExecutionResult]:
         """Close all open positions (emergency flatten)."""
         results = []
-        for symbol in list(self._positions.keys()):
+        with self._position_lock:
+            symbols = list(self._positions.keys())
+        for symbol in symbols:
             price = self.get_latest_price(symbol)
             if price <= 0:
-                price = self._positions[symbol].entry_price
+                with self._position_lock:
+                    pos = self._positions.get(symbol)
+                price = pos.entry_price if pos else 0
             result = self._close_position(symbol, price, agent)
             results.append(result)
         return results
+
+    # ─── OCO (One-Cancels-Other) Management ───
+
+    def _cancel_paired_order(self, filled_order_id: str) -> None:
+        """Cancel the OCO partner when one side fills."""
+        paired_id = self._oco_pairs.pop(filled_order_id, None)
+        if paired_id:
+            self._oco_pairs.pop(paired_id, None)
+            try:
+                cancelled = self._adapter.cancel_order(paired_id)
+                if cancelled:
+                    logger.info("  OCO: cancelled paired order %s (filled=%s)", paired_id, filled_order_id)
+                else:
+                    logger.warning("  OCO: failed to cancel paired order %s", paired_id)
+            except Exception as e:
+                logger.warning("  OCO cancel error for %s: %s", paired_id, e)
+
+    def on_fill(self, order_id: str, symbol: str, fill_price: float) -> None:
+        """Callback when an order fills. Cancels the OCO partner and closes the position."""
+        logger.info("Fill received: order=%s, symbol=%s, price=%.2f", order_id, symbol, fill_price)
+        self._cancel_paired_order(order_id)
+
+        with self._position_lock:
+            pos = self._positions.get(symbol)
+        if pos:
+            if pos.direction == "long":
+                pnl = (fill_price - pos.entry_price) * pos.shares
+            else:
+                pnl = (pos.entry_price - fill_price) * pos.shares
+
+            emoji = "✅" if pnl > 0 else "❌"
+            logger.info("%s TP/SL fill: %s %s | P&L=$%.2f", emoji, pos.direction.upper(), symbol, pnl)
+            with self._position_lock:
+                self._positions.pop(symbol, None)
+            self._trailing_stops.pop(symbol, None)
 
     # ─── TP/SL Auto-Management (from hyperliquid-trading-agent) ───
 
@@ -784,10 +1044,13 @@ class BrokerBridge:
         direction: str,
         tp_price: Optional[float] = None,
         sl_price: Optional[float] = None,
+        shares: Optional[int] = None,
     ) -> None:
         """Place take-profit and stop-loss orders after opening a position.
 
-        If tp_price/sl_price are not provided, auto-calculates from defaults.
+        TP is placed as a limit order, SL is placed as a stop order.
+        Both are tracked as an OCO pair so filling one cancels the other.
+        Uses provided shares (for partial fills) or falls back to position shares.
         """
         if tp_price is None:
             if direction == "long":
@@ -801,33 +1064,192 @@ class BrokerBridge:
             else:
                 sl_price = round(entry_price * (1 + self._default_sl_pct / 100), 2)
 
-        # Place TP/SL as limit orders if broker supports it
-        pos = self._positions.get(symbol)
+        with self._position_lock:
+            pos = self._positions.get(symbol)
         if pos:
+            order_shares = shares or pos.shares
             close_action = "SELL" if direction == "long" else "BUY"
+            tp_order_id = None
+            sl_order_id = None
+
+            # Place TP as limit order
             try:
-                self._adapter.place_limit_order(symbol, close_action, pos.shares, tp_price)
-                logger.info("  TP placed: %s %s @ $%.2f", symbol, close_action, tp_price)
+                tp_result = self._adapter.place_limit_order(symbol, close_action, order_shares, tp_price)
+                if tp_result.success:
+                    tp_order_id = tp_result.order_id
+                    logger.info("  TP placed: %s %s @ $%.2f [order=%s]", symbol, close_action, tp_price, tp_order_id)
             except Exception as e:
                 logger.warning("  TP order failed: %s", e)
+
+            # Place SL as stop order (NOT limit order)
+            try:
+                sl_result = self._adapter.place_stop_order(symbol, close_action, order_shares, sl_price)
+                if sl_result.success:
+                    sl_order_id = sl_result.order_id
+                    logger.info("  SL placed (STOP): %s %s @ $%.2f [order=%s]", symbol, close_action, sl_price, sl_order_id)
+            except Exception as e:
+                logger.warning("  SL stop order failed: %s", e)
+
+            # Track OCO pair
+            if tp_order_id and sl_order_id:
+                self._oco_pairs[tp_order_id] = sl_order_id
+                self._oco_pairs[sl_order_id] = tp_order_id
+                logger.info("  OCO pair linked: TP=%s <-> SL=%s", tp_order_id, sl_order_id)
 
             logger.info(
                 "  Auto TP/SL for %s: TP=$%.2f (+%.1f%%), SL=$%.2f (-%.1f%%)",
                 symbol, tp_price, self._default_tp_pct, sl_price, self._default_sl_pct,
             )
 
+    # ─── Trailing Stops ───
+
+    def set_trailing_stop(
+        self,
+        symbol: str,
+        direction: str,
+        activation_pct: float = 0.02,
+        trail_pct: float = 0.015,
+    ) -> None:
+        """Configure a trailing stop for a position.
+
+        Args:
+            symbol: Ticker symbol.
+            direction: "long" or "short".
+            activation_pct: Activate after this % profit (e.g. 0.02 = 2%).
+            trail_pct: Trail by this % from peak/trough (e.g. 0.015 = 1.5%).
+        """
+        pos = self._positions.get(symbol)
+        if not pos:
+            logger.warning("Cannot set trailing stop: no position for %s", symbol)
+            return
+
+        self._trailing_stops[symbol] = TrailingStop(
+            symbol=symbol,
+            direction=direction,
+            activation_pct=activation_pct,
+            trail_pct=trail_pct,
+            highest_price=pos.entry_price,
+            lowest_price=pos.entry_price,
+        )
+        logger.info(
+            "Trailing stop set: %s %s | activate=%.1f%%, trail=%.1f%%",
+            symbol, direction, activation_pct * 100, trail_pct * 100,
+        )
+
+    def _update_trailing_stops(self, symbol: str, current_price: float) -> bool:
+        """Update trailing stop for a symbol. Returns True if stop triggered.
+
+        For longs: tracks highest price, sets stop at highest*(1-trail_pct).
+        For shorts: tracks lowest price, sets stop at lowest*(1+trail_pct).
+        """
+        ts = self._trailing_stops.get(symbol)
+        if not ts:
+            return False
+
+        pos = self._positions.get(symbol)
+        if not pos:
+            self._trailing_stops.pop(symbol, None)
+            return False
+
+        entry = pos.entry_price
+
+        if ts.direction == "long":
+            ts.highest_price = max(ts.highest_price, current_price)
+
+            if not ts.activated:
+                if current_price >= entry * (1 + ts.activation_pct):
+                    ts.activated = True
+                    ts.stop_price = ts.highest_price * (1 - ts.trail_pct)
+                    logger.info(
+                        "Trailing stop ACTIVATED: %s long | stop=$%.2f",
+                        symbol, ts.stop_price,
+                    )
+            else:
+                ts.stop_price = ts.highest_price * (1 - ts.trail_pct)
+                if current_price <= ts.stop_price:
+                    logger.info(
+                        "⚠️ TRAILING STOP TRIGGERED: %s long | price=$%.2f <= stop=$%.2f",
+                        symbol, current_price, ts.stop_price,
+                    )
+                    return True
+
+        elif ts.direction == "short":
+            ts.lowest_price = min(ts.lowest_price, current_price)
+
+            if not ts.activated:
+                if current_price <= entry * (1 - ts.activation_pct):
+                    ts.activated = True
+                    ts.stop_price = ts.lowest_price * (1 + ts.trail_pct)
+                    logger.info(
+                        "Trailing stop ACTIVATED: %s short | stop=$%.2f",
+                        symbol, ts.stop_price,
+                    )
+            else:
+                ts.stop_price = ts.lowest_price * (1 + ts.trail_pct)
+                if current_price >= ts.stop_price:
+                    logger.info(
+                        "⚠️ TRAILING STOP TRIGGERED: %s short | price=$%.2f >= stop=$%.2f",
+                        symbol, current_price, ts.stop_price,
+                    )
+                    return True
+
+        return False
+
     # ─── Force-Close on Max Loss (from hyperliquid-trading-agent) ───
 
     def check_and_force_close(self, agent: Optional[Any] = None) -> List[ExecutionResult]:
-        """Check all positions for max loss and force-close if exceeded.
+        """Check all positions for max loss / trailing stops and force-close.
 
         Returns:
             List of ExecutionResults for force-closed positions.
         """
         results = []
-        for symbol, pos in list(self._positions.items()):
+        with self._position_lock:
+            positions_snapshot = list(self._positions.items())
+        for symbol, pos in positions_snapshot:
             current_price = self.get_latest_price(symbol)
             if current_price <= 0:
+                continue
+
+            # FIX 8: Increment bars held and check max holding period
+            pos.bars_held += 1
+            if pos.max_holding_bars > 0 and pos.bars_held > pos.max_holding_bars:
+                logger.warning(
+                    "⚠️ MAX HOLDING PERIOD: %s %s held %d bars (max=%d). Force closing.",
+                    pos.direction.upper(), symbol, pos.bars_held, pos.max_holding_bars,
+                )
+                result = self._close_position(symbol, current_price, agent)
+                if result.success:
+                    self._trailing_stops.pop(symbol, None)
+                    self._write_diary({
+                        "action": "MAX_HOLDING_CLOSE",
+                        "symbol": symbol,
+                        "direction": pos.direction,
+                        "bars_held": pos.bars_held,
+                        "max_holding_bars": pos.max_holding_bars,
+                        "entry_price": pos.entry_price,
+                        "exit_price": current_price,
+                    })
+                results.append(result)
+                continue
+
+            # Check trailing stops first
+            if self._update_trailing_stops(symbol, current_price):
+                logger.warning(
+                    "⚠️ TRAILING STOP CLOSE: %s %s @ $%.2f",
+                    pos.direction.upper(), symbol, current_price,
+                )
+                result = self._close_position(symbol, current_price, agent)
+                if result.success:
+                    self._trailing_stops.pop(symbol, None)
+                    self._write_diary({
+                        "action": "TRAILING_STOP_CLOSE",
+                        "symbol": symbol,
+                        "direction": pos.direction,
+                        "entry_price": pos.entry_price,
+                        "exit_price": current_price,
+                    })
+                results.append(result)
                 continue
 
             # Calculate loss %
@@ -877,20 +1299,40 @@ class BrokerBridge:
             if abs(qty) > 0:
                 broker_symbols.add(sym)
 
-        # Remove stale local positions
-        for sym in list(self._positions.keys()):
-            if sym not in broker_symbols:
-                logger.info("Reconcile: removing stale position %s (not on broker)", sym)
-                reconciliation["removed"].append(sym)
-                del self._positions[sym]
+    # Remove stale local positions
+        with self._position_lock:
+            for sym in list(self._positions.keys()):
+                if sym not in broker_symbols:
+                    logger.info("Reconcile: removing stale position %s (not on broker)", sym)
+                    reconciliation["removed"].append(sym)
+                    del self._positions[sym]
 
-        # Note missing local positions (on broker but not tracked locally)
-        for sym in broker_symbols:
-            if sym in self._positions:
-                reconciliation["matched"] += 1
-            else:
+        # FIX 6: Adopt broker positions not tracked locally
+        for bp in broker_positions:
+            sym = bp.get("symbol", "")
+            qty = float(bp.get("quantity", 0))
+            avg_cost = float(bp.get("avg_cost", bp.get("averagePrice", bp.get("avg_price", 0))))
+            if abs(qty) > 0 and sym not in self._positions:
+                direction = "long" if qty > 0 else "short"
+                with self._position_lock:
+                    self._positions[sym] = Position(
+                        symbol=sym,
+                        direction=direction,
+                        shares=int(abs(qty)),
+                        entry_price=avg_cost,
+                        entry_time=datetime.now().isoformat(),
+                    )
+                notional = abs(qty * avg_cost)
+                self._portfolio_gate.register_position(
+                    sym, int(abs(qty)), avg_cost, "adopted", self._adapter.name,
+                )
                 reconciliation["added"].append(sym)
-                logger.info("Reconcile: broker has %s but not tracked locally", sym)
+                logger.info(
+                    "Adopted broker position: %s %d shares @ $%.2f",
+                    sym, int(abs(qty)), avg_cost,
+                )
+            elif abs(qty) > 0 and sym in self._positions:
+                reconciliation["matched"] += 1
 
         if reconciliation["removed"] or reconciliation["added"]:
             logger.info("Reconciliation: %s", reconciliation)
@@ -899,15 +1341,40 @@ class BrokerBridge:
 
     # ─── Trade Diary — JSONL Logging (from hyperliquid-trading-agent) ───
 
+    # Fix 3: diary file rotation constants
+    _DIARY_MAX_SIZE = 10 * 1024 * 1024  # 10 MB
+    _DIARY_MAX_ROTATED = 5
+
+    def _rotate_diary(self) -> None:
+        """Rotate diary file when it exceeds 10 MB. Keeps max 5 rotated files."""
+        # Remove oldest rotated files beyond the keep limit
+        for i in range(self._DIARY_MAX_ROTATED, 0, -1):
+            old = f"{self._diary_path}.{i}.jsonl"
+            if i == self._DIARY_MAX_ROTATED and os.path.exists(old):
+                os.remove(old)
+            elif os.path.exists(old):
+                os.rename(old, f"{self._diary_path}.{i + 1}.jsonl")
+
+        # Rotate current file to .1.jsonl
+        if os.path.exists(self._diary_path):
+            os.rename(self._diary_path, f"{self._diary_path}.1.jsonl")
+            logger.info("Diary rotated: %s (exceeded %d MB)",
+                        self._diary_path, self._DIARY_MAX_SIZE // (1024 * 1024))
+
     def _write_diary(self, entry: Dict[str, Any]) -> None:
-        """Write an entry to the JSONL trade diary."""
+        """Write an entry to the JSONL trade diary with automatic rotation."""
         import json as _json
         entry["timestamp"] = datetime.now().isoformat()
         entry["broker"] = self._adapter.name
         entry["mode"] = self._mode
 
         try:
-            with open(self._diary_path, "a") as f:
+            # Fix 3: rotate if file exceeds max size
+            if os.path.exists(self._diary_path):
+                if os.path.getsize(self._diary_path) > self._DIARY_MAX_SIZE:
+                    self._rotate_diary()
+
+            with open(self._diary_path, "a", encoding="utf-8") as f:
                 f.write(_json.dumps(entry, default=str) + "\n")
         except Exception as e:
             logger.warning("Diary write failed: %s", e)
@@ -917,7 +1384,7 @@ class BrokerBridge:
         import json as _json
         entries = []
         try:
-            with open(self._diary_path, "r") as f:
+            with open(self._diary_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
             for line in lines[-n:]:
                 try:

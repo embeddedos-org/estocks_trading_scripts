@@ -276,8 +276,11 @@ class LLMReasoner:
         """Parse LLM JSON response into structured decision."""
         cleaned = text.strip()
         if cleaned.startswith("```"):
-            first_nl = cleaned.index("\n")
-            cleaned = cleaned[first_nl + 1:]
+            first_nl = cleaned.find("\n")
+            if first_nl == -1:
+                cleaned = ""
+            else:
+                cleaned = cleaned[first_nl + 1:]
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3].rstrip()
 

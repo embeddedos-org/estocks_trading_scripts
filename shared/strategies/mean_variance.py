@@ -77,7 +77,7 @@ class MeanVarianceOptimizer:
         cons = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
 
         if c.target_return is not None:
-            cons.append({"type": "eq", "fun": lambda w: np.dot(w, self.mean_returns) - c.target_return})
+            cons.append({"type": "eq", "fun": lambda w, _c=c: np.dot(w, self.mean_returns) - _c.target_return})
 
         w0 = np.ones(self.n_assets) / self.n_assets
         result = minimize(neg_sharpe, w0, method="SLSQP", bounds=bounds, constraints=cons)

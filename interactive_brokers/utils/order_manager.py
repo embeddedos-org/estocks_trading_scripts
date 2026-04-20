@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, date
 from enum import Enum
@@ -121,7 +122,7 @@ class OrderManager:
     def _create_contract(self, symbol: str, sec_type: str = "STK",
                          exchange: str = "SMART", currency: str = "USD",
                          **kwargs: Any) -> Any:
-        """Create an ib_async Contract object.
+        """Create a Contract object using ib_async or ibapi.
 
         Args:
             symbol: Ticker symbol.
@@ -154,8 +155,24 @@ class OrderManager:
             self.connection.qualifyContracts(contract)
             return contract
         except ImportError:
-            logger.error("ib_async required for contract creation")
-            raise
+            try:
+                from ibapi.contract import Contract as IBApiContract
+
+                contract = IBApiContract()
+                contract.symbol = symbol
+                contract.secType = sec_type
+                contract.exchange = exchange
+                contract.currency = currency
+                if sec_type == "OPT":
+                    contract.lastTradeDateOrContractMonth = kwargs.get("expiry", "")
+                    contract.strike = kwargs.get("strike", 0)
+                    contract.right = kwargs.get("right", "C")
+                elif sec_type == "FUT":
+                    contract.lastTradeDateOrContractMonth = kwargs.get("expiry", "")
+                return contract
+            except ImportError:
+                logger.error("Neither ib_async nor ibapi available for contract creation")
+                raise
 
     def _create_order(self, action: str, quantity: float,
                       order_type: str = "MKT", **kwargs: Any) -> Any:
@@ -249,7 +266,7 @@ class OrderManager:
             self._daily_pnl = 0.0
             self._daily_pnl_date = date.today()
 
-        if abs(self._daily_pnl) >= self.risk_config.max_daily_loss:
+        if self._daily_pnl <= -self.risk_config.max_daily_loss:
             raise ValueError(
                 f"Daily loss limit reached: ${self._daily_pnl:,.2f} "
                 f"(max: ${self.risk_config.max_daily_loss:,.2f})"
@@ -261,7 +278,7 @@ class OrderManager:
                      stop_price: Optional[float] = None,
                      parent_id: Optional[int] = None) -> OrderStatus:
         """Register an order in the tracking system."""
-        order_id = trade.order.orderId if hasattr(trade, 'order') else id(trade)
+        order_id = trade.order.orderId if hasattr(trade, 'order') else int(uuid.uuid4().hex[:12], 16)
 
         status = OrderStatus(
             order_id=order_id,
@@ -277,7 +294,7 @@ class OrderManager:
         logger.info(
             "Order tracked: %s %s %.0f %s @ %s [id=%d]",
             action, symbol, quantity, order_type,
-            limit_price or "MKT", order_id,
+            limit_price if limit_price is not None else "MKT", order_id,
         )
         return status
 
@@ -326,13 +343,18 @@ class OrderManager:
             symbol: Ticker symbol.
             action: "BUY" or "SELL".
             quantity: Number of shares/contracts.
-            limit_price: Limit price.
+            limit_price: Limit price (must be > 0).
             sec_type: Security type.
             tif: Time in force (GTC, DAY, IOC, etc.).
 
         Returns:
             The Trade object from ib_async.
+
+        Raises:
+            ValueError: If limit_price is <= 0.
         """
+        if limit_price <= 0:
+            raise ValueError(f"Limit price must be positive, got {limit_price}")
         self._validate_order(symbol, action, quantity, limit_price)
 
         contract = self._create_contract(symbol, sec_type, **kwargs)
@@ -474,7 +496,10 @@ class OrderManager:
                 return False
 
         try:
-            open_orders = self.connection.ib.openOrders() if hasattr(self.connection, 'ib') else []
+            if not hasattr(self.connection, 'ib'):
+                logger.warning("cancel_order requires IBAsyncConnection with .ib attribute")
+                return False
+            open_orders = self.connection.ib.openOrders()
             for order in open_orders:
                 if order.orderId == order_id:
                     self.connection.cancelOrder(order)
@@ -511,7 +536,10 @@ class OrderManager:
             return False
 
         try:
-            open_trades = self.connection.ib.openTrades() if hasattr(self.connection, 'ib') else []
+            if not hasattr(self.connection, 'ib'):
+                logger.warning("modify_order requires IBAsyncConnection with .ib attribute")
+                return False
+            open_trades = self.connection.ib.openTrades()
             for trade in open_trades:
                 if trade.order.orderId == order_id:
                     if new_limit_price is not None:

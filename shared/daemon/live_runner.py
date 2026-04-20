@@ -50,6 +50,8 @@ import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+from shared.utils.market_hours import MarketHours
+
 # Configure logging
 LOG_DIR = os.path.join(os.path.expanduser("~"), ".stocks_plugin", "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -144,9 +146,31 @@ class LiveRunner:
         self._paper_capital = 100_000.0
         self._paper_pnl = 0.0
 
-        # Signal handler for graceful shutdown
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
+        # Holding period tracking (Fix 5)
+        self._tick_count = 0
+        self._entry_bars: Dict[str, int] = {}
+
+        # FIX 5: Commission rate for paper trading P&L
+        self._commission_per_share = 0.005
+
+        # FIX 8: Max holding period for paper positions (bars)
+        self._max_holding_bars = 240
+
+        # Market hours enforcement
+        self._market_hours = MarketHours()
+
+        # Risk manager (optional, set externally or from agent)
+        self._risk_manager = None
+
+        # Signal handler for graceful shutdown (Fix 17: guard for non-main thread)
+        try:
+            signal.signal(signal.SIGINT, self._signal_handler)
+            signal.signal(signal.SIGTERM, self._signal_handler)
+        except (ValueError, OSError):
+            logger.warning("Could not install signal handlers (not in main thread)")
+
+        # Fix 2: consecutive error escalation
+        self._consecutive_errors: int = 0
 
         # Optional LLM reasoning layer
         self._llm_reasoner = None
@@ -190,6 +214,7 @@ class LiveRunner:
         while self._running:
             try:
                 self._run_cycle()
+                self._consecutive_errors = 0  # Fix 2: reset on success
                 self._cycle_count += 1
 
                 if self._running:
@@ -198,25 +223,106 @@ class LiveRunner:
             except KeyboardInterrupt:
                 break
             except Exception as e:
-                logger.error("Cycle error: %s", e, exc_info=True)
-                time.sleep(60)  # wait 1 minute on error
+                # Fix 2: error escalation
+                self._consecutive_errors += 1
+                logger.error(
+                    "Cycle error (#%d consecutive): %s",
+                    self._consecutive_errors, e, exc_info=True,
+                )
+                if self._consecutive_errors > 10:
+                    logger.critical(
+                        "SHUTDOWN: %d consecutive errors exceeded threshold (10). "
+                        "Stopping daemon.",
+                        self._consecutive_errors,
+                    )
+                    self._running = False
+                elif self._consecutive_errors > 5:
+                    alert_msg = (
+                        f"⚠️ LiveRunner: {self._consecutive_errors} consecutive errors. "
+                        f"Latest: {e}"
+                    )
+                    logger.warning(alert_msg)
+                    if hasattr(self, '_broker_bridge') and self._broker_bridge:
+                        try:
+                            from shared.notifier import AlertDispatcher
+                            dispatcher = AlertDispatcher()
+                            dispatcher.dispatch(
+                                title="LiveRunner Error Escalation",
+                                message=alert_msg,
+                                level="warning",
+                            )
+                        except Exception:
+                            pass
+                time.sleep(60)
 
         self._shutdown()
 
     def _run_cycle(self) -> None:
         """Execute one decision cycle for all symbols."""
-        market_open = self._data_fetcher.is_market_open()
-        now = datetime.now()
+        self._tick_count += 1
+
+        # FIX 9: Sync position tracking to avoid dual-tracking divergence
+        self._sync_positions()
+
+        market_open = self._market_hours.is_market_open()
+        trading_allowed = self._market_hours.is_trading_allowed()
+        now = datetime.now(timezone.utc)
 
         logger.info(
-            "─── Cycle #%d | %s | Market: %s ───",
+            "─── Cycle #%d | %s | Market: %s | Trading: %s ───",
             self._cycle_count + 1,
             now.strftime("%Y-%m-%d %H:%M:%S"),
             "OPEN" if market_open else "CLOSED",
+            "ALLOWED" if trading_allowed else "BLOCKED",
         )
+
+        # GAP #7: Periodic retrain on a schedule
+        RETRAIN_INTERVAL_CYCLES = 5000  # roughly every ~17 hours at 12 cycles/hr
+        if self._tick_count > 0 and self._tick_count % RETRAIN_INTERVAL_CYCLES == 0:
+            logger.info("Scheduled periodic retrain (cycle %d)", self._tick_count)
+            try:
+                for sym in self._symbols[:1]:  # Use first symbol as representative
+                    retrain_df = self._data_fetcher.fetch_ohlcv(sym, period="2y", interval="1d")
+                    if retrain_df is not None and len(retrain_df) > 200:
+                        self._agent.train(retrain_df, verbose=False)
+                        logger.info("Periodic retrain complete on %s (%d bars)", sym, len(retrain_df))
+                        break
+            except Exception as e:
+                logger.error("Periodic retrain failed: %s", e)
+
+        # Market hours enforcement: skip processing if trading is not allowed
+        if not trading_allowed:
+            # GAP #8: Use off-hours productively
+            if self._tick_count % 360 == 0:  # Every ~30 min during off-hours
+                self._off_hours_maintenance()
+            logger.info("Trading not allowed outside configured market hours. Skipping cycle.")
+            return
+
+        # End-of-day flatten: close all positions before market close
+        if self._market_hours.should_flatten_eod():
+            remaining = self._market_hours.time_to_close()
+            logger.warning(
+                "EOD flatten triggered — %s remaining before close. Closing all positions.",
+                remaining,
+            )
+            self._flatten_all_positions()
+            return
 
         for symbol in self._symbols:
             try:
+                # FIX 8: Check max holding period for paper positions
+                if symbol in self._paper_positions:
+                    bars_held = self._tick_count - self._entry_bars.get(symbol, self._tick_count)
+                    if self._max_holding_bars > 0 and bars_held > self._max_holding_bars:
+                        logger.warning(
+                            "⚠️ PAPER MAX HOLDING: %s held %d bars (max=%d). Force closing.",
+                            symbol, bars_held, self._max_holding_bars,
+                        )
+                        df = self._data_fetcher.fetch_ohlcv(symbol, period="5d", interval="1d")
+                        price = float(df["close"].iloc[-1]) if df is not None and not df.empty else self._paper_positions[symbol]["entry_price"]
+                        self._close_paper_position(symbol, price)
+                        continue
+
                 self._process_symbol(symbol, market_open)
             except Exception as e:
                 logger.error("Error processing %s: %s", symbol, e)
@@ -234,6 +340,49 @@ class LiveRunner:
         # Periodic status report
         if self._cycle_count % 12 == 0:  # every 12 cycles
             self._print_status_report()
+
+    def _sync_positions(self) -> None:
+        """FIX 9: Reconcile dual position tracking to prevent divergence.
+
+        If broker_bridge is active and connected, paper positions are cleared
+        (bridge is the source of truth). If the bridge fails mid-session,
+        log CRITICAL instead of silently falling back to paper.
+        """
+        if self._broker_bridge is not None:
+            if self._broker_bridge.is_connected():
+                if self._paper_positions:
+                    logger.info(
+                        "Position sync: clearing %d paper positions (broker bridge is active)",
+                        len(self._paper_positions),
+                    )
+                    self._paper_positions.clear()
+                    self._entry_bars.clear()
+            else:
+                # Bridge exists but disconnected — do NOT silently fall back
+                logger.critical(
+                    "POSITION SYNC: broker bridge configured but DISCONNECTED. "
+                    "NOT falling back to paper trading. Attempting reconnect..."
+                )
+                try:
+                    if self._broker_bridge.connect():
+                        logger.info("Broker reconnected successfully")
+                    else:
+                        logger.critical("Broker reconnect FAILED. Skipping trades this cycle.")
+                except Exception as e:
+                    logger.critical("Broker reconnect error: %s", e)
+
+        # Position count reconciliation check
+        if self._broker_bridge and self._broker_bridge.is_connected():
+            bridge_count = len(self._broker_bridge.get_positions())
+            paper_count = len(self._paper_positions)
+            if paper_count > 0 and bridge_count > 0:
+                logger.warning(
+                    "POSITION DIVERGENCE: bridge has %d positions, paper has %d. "
+                    "Clearing paper positions.",
+                    bridge_count, paper_count,
+                )
+                self._paper_positions.clear()
+                self._entry_bars.clear()
 
     def _process_symbol(self, symbol: str, market_open: bool) -> None:
         """Process a single symbol: fetch data → analyze → decide."""
@@ -290,8 +439,21 @@ class LiveRunner:
                     sentiment={"sentiment_score": sentiment_score} if sentiment_score else None,
                     risk_status=decision.get("risk_status"),
                 )
-                action = llm_result.get("action", action)
-                confidence = llm_result.get("confidence", confidence)
+                llm_action = llm_result.get("action", action)
+                llm_confidence = llm_result.get("confidence", confidence)
+
+                # Re-check risk manager before accepting LLM override
+                if llm_action != "HOLD" and llm_action != action:
+                    if self._risk_manager is not None and not self._risk_manager.can_trade():
+                        logger.warning(
+                            "LLM override %s->%s blocked by risk manager",
+                            action, llm_action,
+                        )
+                        llm_action = "HOLD"
+                        llm_confidence = 0.0
+
+                action = llm_action
+                confidence = llm_confidence
                 # Pass TP/SL from LLM to broker bridge
                 decision["tp_price"] = llm_result.get("tp_price")
                 decision["sl_price"] = llm_result.get("sl_price")
@@ -338,10 +500,11 @@ class LiveRunner:
     ) -> None:
         """Simulate a trade in paper mode."""
         has_position = symbol in self._paper_positions
+        current_pos = self._paper_positions.get(symbol)
 
         if action == "BUY" and not has_position:
             # Open long position
-            shares = int(self._paper_capital * 0.1 / price)  # 10% of capital per position
+            shares = int(self._paper_capital * 0.1 / price)
             if shares > 0:
                 cost = shares * price
                 self._paper_positions[symbol] = {
@@ -350,30 +513,19 @@ class LiveRunner:
                     "entry_time": datetime.now().isoformat(),
                     "direction": "long",
                 }
+                self._entry_bars[symbol] = self._tick_count
                 logger.info(
                     "  📈 PAPER BUY: %d shares of %s @ $%.2f ($%.2f)",
                     shares, symbol, price, cost,
                 )
 
-        elif action == "SELL" and has_position:
-            # Close position
-            pos = self._paper_positions.pop(symbol)
-            pnl = (price - pos["entry_price"]) * pos["shares"]
-            pnl_pct = (price - pos["entry_price"]) / pos["entry_price"]
-            self._paper_pnl += pnl
+        elif action == "BUY" and has_position and current_pos["direction"] == "short":
+            # Close short position
+            self._close_paper_position(symbol, price)
 
-            emoji = "✅" if pnl > 0 else "❌"
-            logger.info(
-                "  %s PAPER SELL: %d shares of %s @ $%.2f | P&L: $%.2f (%.2f%%)",
-                emoji, pos["shares"], symbol, price, pnl, pnl_pct * 100,
-            )
-
-            # Record outcome in agent memory
-            self._agent.record_outcome(
-                exit_price=price,
-                pnl=pnl,
-                holding_period_bars=1,
-            )
+        elif action == "SELL" and has_position and current_pos["direction"] == "long":
+            # Close long position
+            self._close_paper_position(symbol, price)
 
         elif action == "SELL" and not has_position:
             # Open short position (paper)
@@ -385,10 +537,53 @@ class LiveRunner:
                     "entry_time": datetime.now().isoformat(),
                     "direction": "short",
                 }
+                self._entry_bars[symbol] = self._tick_count
                 logger.info(
                     "  📉 PAPER SHORT: %d shares of %s @ $%.2f",
                     shares, symbol, price,
                 )
+
+        elif action == "SELL" and has_position and current_pos["direction"] == "short":
+            logger.debug("Already short %s, skipping SELL", symbol)
+
+        elif action == "BUY" and has_position and current_pos["direction"] == "long":
+            logger.debug("Already long %s, skipping BUY", symbol)
+
+    def _close_paper_position(self, symbol: str, exit_price: float) -> None:
+        """Close a paper position (long or short) and record outcome."""
+        pos = self._paper_positions.pop(symbol, None)
+        if not pos:
+            return
+
+        direction = pos["direction"]
+        entry_price = pos["entry_price"]
+        shares = pos["shares"]
+
+        if direction == "long":
+            raw_pnl = (exit_price - entry_price) * shares
+        else:
+            raw_pnl = (entry_price - exit_price) * shares
+
+        # FIX 5: Deduct commissions (entry + exit)
+        commission = self._commission_per_share * shares * 2
+        pnl = raw_pnl - commission
+
+        pnl_pct = pnl / (entry_price * shares) * 100
+        self._paper_pnl += pnl
+
+        holding_bars = self._tick_count - self._entry_bars.pop(symbol, self._tick_count)
+        close_label = "PAPER SELL" if direction == "long" else "PAPER COVER"
+        emoji = "✅" if pnl > 0 else "❌"
+        logger.info(
+            "  %s %s: %d shares of %s @ $%.2f | raw=$%.2f comm=$%.2f net=$%.2f (%.2f%%) | held %d bars",
+            emoji, close_label, shares, symbol, exit_price, raw_pnl, commission, pnl, pnl_pct, holding_bars,
+        )
+
+        self._agent.record_outcome(
+            exit_price=exit_price,
+            pnl=pnl,
+            holding_period_bars=holding_bars,
+        )
 
     def _execute_live_trade(
         self, symbol: str, action: str, price: float, confidence: float,
@@ -445,9 +640,28 @@ class LiveRunner:
         logger.info("INITIAL TRAINING PHASE")
         logger.info("=" * 60)
 
-        # Use the first symbol's data for training
+        # GAP #1: Wire data fetcher into agent for fresh auto-retrain data
+        self._agent.set_data_fetcher(self._data_fetcher, self._symbols)
+
+        # GAP #6: Try to load existing saved models first
+        model_dir = os.path.join(os.path.expanduser("~"), ".stocks_plugin", "models")
+        if os.path.isdir(model_dir) and os.listdir(model_dir):
+            try:
+                self._agent.load_models(model_dir)
+                logger.info("Loaded pre-trained models from %s", model_dir)
+
+                # Also load ensemble weights
+                weights_path = os.path.join(model_dir, "ensemble_weights.json")
+                if hasattr(self._agent, '_ensemble') and hasattr(self._agent._ensemble, 'load_weights'):
+                    self._agent._ensemble.load_weights(weights_path)
+
+                return  # Skip fresh training
+            except Exception as e:
+                logger.warning("Failed to load saved models: %s. Training fresh.", e)
+
+        # No saved models — train from scratch
         primary_symbol = self._symbols[0]
-        logger.info("Fetching 2 years of %s data for training...", primary_symbol)
+        logger.info("No saved models found. Fetching 2 years of %s data for training...", primary_symbol)
 
         df = self._data_fetcher.fetch_ohlcv(primary_symbol, period="2y", interval="1d")
         if df is None or df.empty:
@@ -554,32 +768,111 @@ class LiveRunner:
         logger.info("Shutdown signal received (signal=%d)", signum)
         self._running = False
 
+    def _flatten_all_positions(self) -> None:
+        """Close all open positions for end-of-day flatten."""
+        # Close paper positions
+        if self._paper_positions:
+            symbols_to_close = list(self._paper_positions.keys())
+            for symbol in symbols_to_close:
+                try:
+                    df = self._data_fetcher.fetch_ohlcv(symbol, period="5d", interval="1d")
+                    if df is not None and not df.empty:
+                        price = float(df["close"].iloc[-1])
+                    else:
+                        price = self._paper_positions[symbol]["entry_price"]
+                    logger.info("  EOD flatten: closing %s @ $%.2f", symbol, price)
+                    self._close_paper_position(symbol, price)
+                except Exception as e:
+                    logger.error("Failed to flatten %s: %s", symbol, e)
+
+        # Close broker positions
+        if self._broker_bridge and self._broker_bridge.is_connected():
+            try:
+                positions = self._broker_bridge.get_positions()
+                for pos in positions:
+                    sym = pos.get("symbol", "")
+                    qty = pos.get("quantity", 0)
+                    if qty != 0:
+                        action = "SELL" if qty > 0 else "BUY"
+                        logger.info("  EOD flatten: %s %d %s via broker", action, abs(qty), sym)
+                        self._broker_bridge.execute_decision(
+                            {"action": action, "confidence": 1.0, "price": 0},
+                            sym,
+                            agent=self._agent,
+                        )
+            except Exception as e:
+                logger.error("Failed to flatten broker positions: %s", e)
+
     def _shutdown(self) -> None:
-        """Graceful shutdown: close positions, save state, report."""
+        """Graceful shutdown: flatten positions, save state, report."""
         logger.info("=" * 60)
         logger.info("SHUTTING DOWN")
         logger.info("=" * 60)
 
-        # Report final state
-        if self._paper_positions:
-            logger.info("OPEN POSITIONS at shutdown:")
-            for sym, pos in self._paper_positions.items():
-                logger.info("  %s: %d shares @ $%.2f", sym, pos["shares"], pos["entry_price"])
-            logger.warning("Paper positions NOT auto-closed. Run again to manage them.")
+        # FIX 6: Flatten ALL positions (broker + paper) before saving
+        logger.info("Shutdown: flattening all positions before exit")
+        try:
+            self._flatten_all_positions()
+        except Exception as e:
+            logger.error("Flatten during shutdown failed (continuing): %s", e)
 
-        logger.info("Total paper P&L: $%.2f", self._paper_pnl)
-        logger.info("Total cycles: %d", self._cycle_count)
+        # Fix 5: log final paper P&L summary
+        logger.info("═" * 40)
+        logger.info("FINAL PAPER P&L SUMMARY")
+        logger.info("  Total paper P&L: $%.2f", self._paper_pnl)
+        logger.info("  Total cycles: %d", self._cycle_count)
+        logger.info("═" * 40)
 
         # Save models
         try:
             model_dir = os.path.join(os.path.expanduser("~"), ".stocks_plugin", "models")
             self._agent.save_models(model_dir)
             logger.info("Models saved to %s", model_dir)
+
+            # GAP #6: Also save ensemble weights on shutdown
+            weights_path = os.path.join(model_dir, "ensemble_weights.json")
+            if hasattr(self._agent, '_ensemble') and hasattr(self._agent._ensemble, 'save_weights'):
+                self._agent._ensemble.save_weights(weights_path)
         except Exception as e:
             logger.warning("Failed to save models: %s", e)
 
+        # Fix 18: save data cache to disk
+        try:
+            self._data_fetcher.save_cache_to_disk()
+        except Exception as e:
+            logger.debug("Cache save failed: %s", e)
+
         self._agent.close()
         logger.info("Daemon stopped.")
+
+    def _off_hours_maintenance(self) -> None:
+        """GAP #8: Use market-closed time for model maintenance and analysis."""
+        try:
+            # 1. Clean up old trade memory (GAP #2)
+            if hasattr(self._agent, '_memory') and self._agent._memory:
+                self._agent._memory.cleanup_old_trades(max_age_days=365, max_records=10000)
+
+            # 2. Update ensemble weights from accumulated memory (GAP #3)
+            if hasattr(self._agent, '_ensemble') and hasattr(self._agent, '_memory'):
+                self._agent._ensemble.update_regime_multipliers_from_memory(self._agent._memory)
+
+            # 3. Run a quick model health check
+            if hasattr(self._agent, '_check_retrain_needed'):
+                self._agent._check_retrain_needed()
+
+            # 4. Save current state
+            model_dir = os.path.join(os.path.expanduser("~"), ".stocks_plugin", "models")
+            os.makedirs(model_dir, exist_ok=True)
+            self._agent.save_models(model_dir)
+
+            # Also save ensemble weights
+            weights_path = os.path.join(model_dir, "ensemble_weights.json")
+            if hasattr(self._agent, '_ensemble') and hasattr(self._agent._ensemble, 'save_weights'):
+                self._agent._ensemble.save_weights(weights_path)
+
+            logger.info("Off-hours maintenance complete")
+        except Exception as e:
+            logger.debug("Off-hours maintenance error: %s", e)
 
 
 # ─── CLI Entry Point ───
@@ -664,9 +957,7 @@ def main() -> None:
         broker_config=broker_config if broker_config else None,
     )
 
-    runner.start(train_first=not args.no_train)
-
-    # Initialize LLM reasoning if requested
+    # Initialize LLM reasoning if requested (must be before runner.start() which blocks)
     if args.llm:
         try:
             from shared.ml.llm_reasoning import LLMReasoner
@@ -680,6 +971,8 @@ def main() -> None:
                 logger.warning("No API key for %s. Set --llm-key or env var.", args.llm)
         except ImportError as e:
             logger.warning("LLM provider not installed: %s", e)
+
+    runner.start(train_first=not args.no_train)
 
 
 if __name__ == "__main__":

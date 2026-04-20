@@ -80,7 +80,7 @@ class RiskParityEngine:
         """
         base_weights = self.inverse_vol_weights(returns)
         recent = returns.tail(self.config.lookback)
-        cov = recent.cov() * 252
+        cov = recent.cov().fillna(0) * 252
         w = base_weights.values
         port_vol = float(np.sqrt(w @ cov.values @ w))
         if port_vol == 0:
@@ -110,11 +110,15 @@ class RiskParityEngine:
             budgets = pd.Series(1.0 / n, index=returns.columns)
 
         recent = returns.tail(self.config.lookback)
-        cov = recent.cov().values * 252
+        cov = recent.cov().fillna(0).values * 252
 
         # Iterative solver: start from inverse-vol, then adjust
         w = np.ones(n) / n
+        prev_w = np.zeros(n)
         for _ in range(100):
+            if np.allclose(w, prev_w, atol=1e-6):
+                break
+            prev_w = w.copy()
             sigma_w = cov @ w
             rc = w * sigma_w
             total_rc = rc.sum()

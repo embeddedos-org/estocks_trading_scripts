@@ -34,9 +34,15 @@ except ImportError:
 
 import sys
 import os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+_parent_path = os.path.join(os.path.dirname(__file__), "..")
+if _parent_path not in sys.path:
+    sys.path.insert(0, _parent_path)
 
-from shared.data.market_data_cache import MarketDataCache
+try:
+    from shared.data.market_data_cache import MarketDataCache
+except ImportError:
+    MarketDataCache = None  # type: ignore[assignment,misc]
+    logger.warning("shared.data.market_data_cache not available — MarketDataCache will be None")
 
 
 def _require_zipline() -> None:

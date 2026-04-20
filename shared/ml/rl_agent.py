@@ -136,47 +136,58 @@ class RLTrader:
         # Create training environment
         self._train_env = DummyVecEnv([lambda: TradingEnv(df, **self._env_config)])
 
-        # Build model
-        default_kwargs = {"verbose": verbose}
-        if self._algorithm_name in ("PPO", "A2C"):
-            default_kwargs.update({
-                "learning_rate": 3e-4,
-                "n_steps": 2048,
-                "gamma": 0.99,
-                "ent_coef": 0.01,
-            })
-        elif self._algorithm_name == "SAC":
-            default_kwargs.update({
-                "learning_rate": 3e-4,
-                "gamma": 0.99,
-                "buffer_size": 50_000,
-            })
-
-        default_kwargs.update(self._model_kwargs)
-
-        self._model = self._algo_class(
-            "MlpPolicy",
-            self._train_env,
-            **default_kwargs,
-        )
-
-        # Evaluation callback
-        callbacks = []
-        if eval_df is not None:
-            eval_env = DummyVecEnv([lambda: TradingEnv(eval_df, **self._env_config)])
-            eval_callback = EvalCallback(
-                eval_env,
-                eval_freq=eval_freq,
-                n_eval_episodes=1,
-                verbose=0,
+        # GAP #5: Continual learning — keep existing policy if available
+        if self._model is not None:
+            # Continue training existing model on new data
+            self._model.set_env(self._train_env)
+            self._model.learn(
+                total_timesteps=total_timesteps,
+                reset_num_timesteps=False,
             )
-            callbacks.append(eval_callback)
+            logger.info("RL agent continual learning: %d additional timesteps", total_timesteps)
+        else:
+            # First time: create new model
+            default_kwargs = {"verbose": verbose}
+            if self._algorithm_name in ("PPO", "A2C"):
+                default_kwargs.update({
+                    "learning_rate": 3e-4,
+                    "n_steps": 2048,
+                    "gamma": 0.99,
+                    "ent_coef": 0.01,
+                })
+            elif self._algorithm_name == "SAC":
+                default_kwargs.update({
+                    "learning_rate": 3e-4,
+                    "gamma": 0.99,
+                    "buffer_size": 50_000,
+                })
 
-        # Train
-        self._model.learn(
-            total_timesteps=total_timesteps,
-            callback=callbacks if callbacks else None,
-        )
+            default_kwargs.update(self._model_kwargs)
+
+            self._model = self._algo_class(
+                "MlpPolicy",
+                self._train_env,
+                **default_kwargs,
+            )
+
+            # Evaluation callback
+            callbacks = []
+            if eval_df is not None:
+                eval_env = DummyVecEnv([lambda: TradingEnv(eval_df, **self._env_config)])
+                eval_callback = EvalCallback(
+                    eval_env,
+                    eval_freq=eval_freq,
+                    n_eval_episodes=1,
+                    verbose=0,
+                )
+                callbacks.append(eval_callback)
+
+            # Train
+            self._model.learn(
+                total_timesteps=total_timesteps,
+                callback=callbacks if callbacks else None,
+            )
+            logger.info("RL agent initial training: %d timesteps", total_timesteps)
 
         self._is_trained = True
 

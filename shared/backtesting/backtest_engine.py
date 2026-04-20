@@ -116,9 +116,7 @@ class BacktestEngine:
 
             if signal == 1 and position == 0:
                 shares = int(capital // price)
-                if shares <= 0:
-                    equity = capital
-                else:
+                if shares > 0:
                     cost = shares * price
                     commission_paid = cost * self.commission
                     capital -= cost + commission_paid

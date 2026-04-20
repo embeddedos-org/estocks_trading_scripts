@@ -68,6 +68,7 @@ class WheelCycle:
     total_premium: float = 0.0
     total_pnl: float = 0.0
     num_rolls: int = 0
+    cycle_pnl: float = 0.0  # running P&L for max loss tracking
 
     @property
     def cost_basis(self) -> float:
@@ -78,7 +79,7 @@ class WheelCycle:
 
     @property
     def is_complete(self) -> bool:
-        return self.phase in (WheelPhase.CALLED_AWAY, WheelPhase.IDLE)
+        return self.phase == WheelPhase.CALLED_AWAY
 
 
 class OptionsWheelStrategy:
@@ -100,14 +101,162 @@ class OptionsWheelStrategy:
         order_manager: Any,
         notifier: Any = None,
         capital: float = 50000.0,
+        max_loss_per_cycle: float = 2000.0,
+        min_iv_rank: float = 30.0,
+        max_iv_rank: float = 100.0,
     ) -> None:
         self.connection = connection
         self.order_manager = order_manager
         self.notifier = notifier
         self.capital = capital
+        self.max_loss_per_cycle = max_loss_per_cycle
+        self.min_iv_rank = min_iv_rank
+        self.max_iv_rank = max_iv_rank
 
         self._cycles: Dict[str, WheelCycle] = {}
         self._completed_cycles: List[WheelCycle] = []
+
+    # ─── IV Rank ───
+
+    def _calculate_iv_rank(self, symbol: str, lookback_days: int = 252) -> float:
+        """Calculate IV Rank for a symbol.
+
+        IV Rank = (current_iv - min_iv) / (max_iv - min_iv) * 100
+
+        Falls back to Historical Volatility percentile rank if
+        implied volatility data is not available.
+
+        Args:
+            symbol: Underlying ticker symbol.
+            lookback_days: Number of trading days to look back.
+
+        Returns:
+            IV Rank as a percentage (0-100).
+        """
+        try:
+            from ib_async import Stock
+            underlying = Stock(symbol, "SMART", "USD")
+            self.connection.qualifyContracts(underlying)
+
+            bars = self.connection.ib.reqHistoricalData(
+                underlying,
+                endDateTime="",
+                durationStr=f"{lookback_days} D",
+                barSizeSetting="1 day",
+                whatToShow="OPTION_IMPLIED_VOLATILITY",
+                useRTH=True,
+                formatDate=1,
+            )
+
+            if bars and len(bars) > 20:
+                iv_values = [b.close for b in bars if b.close > 0]
+                if iv_values:
+                    current_iv = iv_values[-1]
+                    min_iv = min(iv_values)
+                    max_iv = max(iv_values)
+                    if max_iv > min_iv:
+                        iv_rank = (current_iv - min_iv) / (max_iv - min_iv) * 100
+                        logger.info(
+                            "IV Rank for %s: %.1f%% (current=%.4f, min=%.4f, max=%.4f)",
+                            symbol, iv_rank, current_iv, min_iv, max_iv,
+                        )
+                        return iv_rank
+        except Exception as e:
+            logger.warning("IV data unavailable for %s (%s), using HV fallback", symbol, e)
+
+        # Fallback: Historical Volatility percentile rank
+        try:
+            from ib_async import Stock
+            underlying = Stock(symbol, "SMART", "USD")
+            self.connection.qualifyContracts(underlying)
+
+            bars = self.connection.ib.reqHistoricalData(
+                underlying,
+                endDateTime="",
+                durationStr=f"{lookback_days} D",
+                barSizeSetting="1 day",
+                whatToShow="TRADES",
+                useRTH=True,
+                formatDate=1,
+            )
+
+            if bars and len(bars) > 30:
+                closes = pd.Series([b.close for b in bars])
+                returns = closes.pct_change().dropna()
+                rolling_hv = returns.rolling(20).std() * np.sqrt(252)
+                rolling_hv = rolling_hv.dropna()
+
+                if len(rolling_hv) > 0:
+                    current_hv = rolling_hv.iloc[-1]
+                    rank = (rolling_hv < current_hv).sum() / len(rolling_hv) * 100
+                    logger.info(
+                        "HV Rank fallback for %s: %.1f%% (current HV=%.4f)",
+                        symbol, rank, current_hv,
+                    )
+                    return float(rank)
+        except Exception as e:
+            logger.error("HV fallback also failed for %s: %s", symbol, e)
+
+        logger.warning("Cannot compute IV/HV rank for %s, returning 50 (neutral)", symbol)
+        return 50.0
+
+    def check_cycle_max_loss(self, symbol: str, current_price: float) -> bool:
+        """Check if a cycle has exceeded the max loss threshold.
+
+        If the running cycle P&L drops below -max_loss_per_cycle, the cycle
+        is force-closed and skipped to the next cycle.
+
+        Args:
+            symbol: Underlying symbol.
+            current_price: Current market price of the underlying.
+
+        Returns:
+            True if cycle was terminated due to max loss.
+        """
+        cycle = self._cycles.get(symbol)
+        if not cycle:
+            return False
+
+        # Calculate running cycle P&L
+        running_pnl = cycle.total_premium
+        if cycle.phase == WheelPhase.ASSIGNED and cycle.assigned_shares > 0:
+            unrealized = (current_price - cycle.assigned_price) * cycle.assigned_shares
+            running_pnl += unrealized
+        elif cycle.phase == WheelPhase.CC_OPEN and cycle.assigned_shares > 0:
+            unrealized = (current_price - cycle.assigned_price) * cycle.assigned_shares
+            running_pnl += unrealized
+
+        cycle.cycle_pnl = running_pnl
+
+        if running_pnl < -self.max_loss_per_cycle:
+            logger.warning(
+                "Wheel cycle terminated: max loss $%.2f exceeded "
+                "(cycle P&L: $%.2f, limit: -$%.2f)",
+                self.max_loss_per_cycle, running_pnl, self.max_loss_per_cycle,
+            )
+
+            # Force close: sell shares if assigned
+            if cycle.assigned_shares > 0:
+                try:
+                    self.order_manager.market_order(symbol, "SELL", cycle.assigned_shares)
+                except Exception as e:
+                    logger.error("Failed to force-close shares for %s: %s", symbol, e)
+
+            cycle.total_pnl = running_pnl
+            cycle.phase = WheelPhase.CALLED_AWAY
+            cycle.end_date = datetime.now()
+            self._completed_cycles.append(cycle)
+            del self._cycles[symbol]
+
+            msg = (
+                f"Wheel cycle terminated: max loss ${self.max_loss_per_cycle:.0f} exceeded "
+                f"(cycle P&L: ${running_pnl:.2f})"
+            )
+            if self.notifier:
+                self.notifier.warning(msg)
+            return True
+
+        return False
 
     def get_option_chain(
         self,
@@ -233,9 +382,15 @@ class OptionsWheelStrategy:
                     try:
                         self.connection.qualifyContracts(opt)
                         ticker = self.connection.ib.reqMktData(opt, "", False, False)
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(0.2)
 
                         if ticker.modelGreeks:
+                            if (ticker.bid is not None and ticker.ask is not None
+                                    and (ticker.bid <= 0 or ticker.ask <= 0
+                                         or math.isnan(ticker.bid) or math.isnan(ticker.ask))):
+                                self.connection.ib.cancelMktData(opt)
+                                continue
+
                             opt_delta = abs(ticker.modelGreeks.delta)
                             diff = abs(opt_delta - target_delta)
                             if diff < best_delta_diff:
@@ -299,6 +454,30 @@ class OptionsWheelStrategy:
             "Wheel: looking for CSP on %s (delta~%.2f, DTE %d-%d)",
             symbol, target_delta, *dte_range,
         )
+
+        # IV Rank filter: skip if IV rank is below minimum
+        iv_rank = self._calculate_iv_rank(symbol)
+        if iv_rank < self.min_iv_rank:
+            msg = (
+                f"Skipping CSP: IV rank {iv_rank:.1f} below minimum {self.min_iv_rank:.1f} "
+                f"for {symbol}"
+            )
+            logger.info(msg)
+            if self.notifier:
+                self.notifier.info(msg)
+            return None
+
+        if iv_rank > self.max_iv_rank:
+            msg = (
+                f"Skipping CSP: IV rank {iv_rank:.1f} above maximum {self.max_iv_rank:.1f} "
+                f"for {symbol}"
+            )
+            logger.info(msg)
+            if self.notifier:
+                self.notifier.info(msg)
+            return None
+
+        logger.info("IV rank for %s: %.1f%% (range: %.1f-%.1f)", symbol, iv_rank, self.min_iv_rank, self.max_iv_rank)
 
         strike_info = await self.find_strike_by_delta(
             symbol, "P", target_delta, dte_range,
@@ -469,6 +648,57 @@ class OptionsWheelStrategy:
 
         return False
 
+    async def run_wheel_cycle(self, symbol: str) -> None:
+        """Run one iteration of the wheel cycle for a symbol.
+
+        Checks assignment risk, handles phase transitions, and warns/adjusts
+        when early assignment risk is HIGH.
+        """
+        cycle = self._cycles.get(symbol)
+        if not cycle:
+            return
+
+        # Check early assignment risk
+        risk_level = self.check_early_assignment_risk(symbol)
+        if risk_level == "HIGH":
+            msg = (
+                f"⚠️ HIGH early assignment risk for {symbol} "
+                f"(phase={cycle.phase.value}). Consider rolling early."
+            )
+            logger.warning(msg)
+            if self.notifier:
+                self.notifier.warning(msg)
+
+            # Auto-roll if option is near expiry and ITM
+            expiry = cycle.put_expiry if cycle.phase == WheelPhase.CSP_OPEN else cycle.call_expiry
+            if expiry and (expiry - date.today()).days < 5:
+                logger.info("Auto-rolling %s due to HIGH assignment risk", symbol)
+                await self.roll_option(symbol)
+        elif risk_level == "MEDIUM":
+            logger.info("MEDIUM assignment risk for %s — monitoring closely", symbol)
+
+        # Check for unexpected assignment (shares appearing without a cycle transition)
+        try:
+            positions = self.connection.positions()
+            has_shares = any(
+                pos.contract.symbol == symbol
+                and pos.contract.secType == "STK"
+                and pos.position > 0
+                for pos in positions
+            )
+            if has_shares and cycle.phase == WheelPhase.CSP_OPEN:
+                # Normal assignment path
+                self.check_assignment(symbol)
+            elif has_shares and cycle.phase == WheelPhase.IDLE:
+                # Unexpected shares — handle automatically
+                await self._handle_unexpected_assignment(symbol)
+        except Exception as e:
+            logger.debug("Error checking positions for %s: %s", symbol, e)
+
+        # Check if called away
+        if cycle.phase == WheelPhase.CC_OPEN:
+            self.check_called_away(symbol)
+
     def check_called_away(self, symbol: str) -> bool:
         """Check if shares were called away from a covered call.
 
@@ -546,14 +776,176 @@ class OptionsWheelStrategy:
         logger.info("Rolling %s option (roll #%d)", symbol, cycle.num_rolls)
 
         if cycle.phase == WheelPhase.CSP_OPEN:
-            return await self.sell_cash_secured_put(
-                symbol, new_target_delta, new_dte_range, cycle.put_quantity,
+            strike_info = await self.find_strike_by_delta(
+                symbol, "P", new_target_delta, new_dte_range,
             )
+            if not strike_info:
+                logger.warning("No suitable put strike found for roll of %s", symbol)
+                return None
+            try:
+                self.order_manager.limit_order(
+                    symbol=symbol,
+                    action="SELL",
+                    quantity=cycle.put_quantity,
+                    limit_price=strike_info.get("mid", strike_info["bid"]),
+                    sec_type="OPT",
+                    expiry=strike_info["expiry"],
+                    strike=strike_info["strike"],
+                    right="P",
+                )
+            except Exception as e:
+                logger.error("Failed to place rolled CSP order for %s: %s", symbol, e)
+                raise
+            cycle.phase = WheelPhase.CSP_OPEN
+            cycle.put_strike = strike_info["strike"]
+            cycle.put_premium = strike_info.get("mid", 0) * 100 * cycle.put_quantity
+            cycle.put_expiry = strike_info.get("expiry_date")
+            cycle.total_premium += cycle.put_premium
+            return cycle
         elif cycle.phase == WheelPhase.CC_OPEN:
             return await self.sell_covered_call(symbol, new_target_delta, new_dte_range)
 
         logger.warning("Cannot roll in phase %s", cycle.phase)
         return None
+
+    def check_early_assignment_risk(self, symbol: str) -> str:
+        """Assess early assignment risk for a sold option.
+
+        Checks:
+        - Is the option in-the-money (ITM)?
+        - Is an ex-dividend date approaching (within 3 days)?
+        - Is time to expiry < 5 days (gamma risk)?
+
+        Returns:
+            Risk level: "LOW", "MEDIUM", or "HIGH".
+        """
+        cycle = self._cycles.get(symbol)
+        if not cycle:
+            return "LOW"
+
+        risk_factors = 0
+        today = date.today()
+
+        try:
+            # Get current underlying price
+            from ib_async import Stock
+            underlying = Stock(symbol, "SMART", "USD")
+            self.connection.qualifyContracts(underlying)
+            ticker = self.connection.ib.reqMktData(underlying, "", False, False)
+            import asyncio
+            asyncio.get_event_loop().run_until_complete(asyncio.sleep(0.5))
+            current_price = ticker.last if ticker.last and not math.isnan(ticker.last) else ticker.close
+            self.connection.ib.cancelMktData(underlying)
+        except Exception as e:
+            logger.warning("Could not fetch price for %s assignment check: %s", symbol, e)
+            current_price = None
+
+        # Check 1: Is the option ITM?
+        if current_price is not None:
+            if cycle.phase == WheelPhase.CSP_OPEN and current_price < cycle.put_strike:
+                risk_factors += 1
+                logger.info("  Assignment risk: %s put $%.2f is ITM (price=$%.2f)",
+                           symbol, cycle.put_strike, current_price)
+            elif cycle.phase == WheelPhase.CC_OPEN and current_price > cycle.call_strike:
+                risk_factors += 1
+                logger.info("  Assignment risk: %s call $%.2f is ITM (price=$%.2f)",
+                           symbol, cycle.call_strike, current_price)
+
+        # Check 2: Ex-dividend approaching (within 3 days)
+        try:
+            import yfinance as yf
+            info = yf.Ticker(symbol).info
+            ex_div_date = info.get("exDividendDate")
+            if ex_div_date:
+                if isinstance(ex_div_date, (int, float)):
+                    ex_div = datetime.fromtimestamp(ex_div_date).date()
+                else:
+                    ex_div = ex_div_date
+                days_to_ex_div = (ex_div - today).days
+                if 0 <= days_to_ex_div <= 3:
+                    risk_factors += 1
+                    logger.info("  Assignment risk: %s ex-dividend in %d days",
+                               symbol, days_to_ex_div)
+        except Exception as e:
+            logger.debug("Could not check ex-dividend for %s: %s", symbol, e)
+
+        # Check 3: Time to expiry < 5 days (gamma risk)
+        expiry = None
+        if cycle.phase == WheelPhase.CSP_OPEN:
+            expiry = cycle.put_expiry
+        elif cycle.phase == WheelPhase.CC_OPEN:
+            expiry = cycle.call_expiry
+
+        if expiry:
+            days_to_expiry = (expiry - today).days
+            if days_to_expiry < 5:
+                risk_factors += 1
+                logger.info("  Assignment risk: %s expiry in %d days (gamma risk)",
+                           symbol, days_to_expiry)
+
+        if risk_factors >= 2:
+            return "HIGH"
+        elif risk_factors == 1:
+            return "MEDIUM"
+        return "LOW"
+
+    async def _handle_unexpected_assignment(self, symbol: str) -> Optional[WheelCycle]:
+        """Handle unexpected assignment when shares appear in the portfolio.
+
+        Immediately writes a covered call on the assigned shares and sends
+        an alert via the notifier.
+
+        Args:
+            symbol: Underlying symbol with unexpected shares.
+
+        Returns:
+            Updated WheelCycle, or None.
+        """
+        logger.warning("Unexpected assignment detected for %s — handling automatically", symbol)
+
+        # Alert immediately
+        msg = f"⚠️ UNEXPECTED ASSIGNMENT: {symbol} — shares appeared in portfolio. Writing covered call."
+        if self.notifier:
+            self.notifier.warning(msg)
+
+        # Check if we already have a cycle; if not, create one
+        cycle = self._cycles.get(symbol)
+        if not cycle:
+            try:
+                positions = self.connection.positions()
+                assigned_shares = 0
+                for pos in positions:
+                    if pos.contract.symbol == symbol and pos.contract.secType == "STK" and pos.position > 0:
+                        assigned_shares = int(pos.position)
+                        break
+                if assigned_shares == 0:
+                    logger.warning("No shares found for %s during unexpected assignment handling", symbol)
+                    return None
+
+                cycle = WheelCycle(
+                    symbol=symbol,
+                    phase=WheelPhase.ASSIGNED,
+                    assigned_shares=assigned_shares,
+                    assigned_price=0.0,  # unknown, best effort
+                )
+                self._cycles[symbol] = cycle
+            except Exception as e:
+                logger.error("Failed to create cycle for unexpected assignment of %s: %s", symbol, e)
+                return None
+        else:
+            cycle.phase = WheelPhase.ASSIGNED
+
+        # Immediately write a covered call
+        try:
+            result = await self.sell_covered_call(symbol, target_delta=0.30, dte_range=(30, 45))
+            if result:
+                logger.info("Covered call written for unexpected assignment: %s", symbol)
+            else:
+                logger.warning("Could not write covered call for %s", symbol)
+            return result
+        except Exception as e:
+            logger.error("Failed to write covered call for %s after unexpected assignment: %s", symbol, e)
+            return None
 
     def get_active_cycles(self) -> Dict[str, WheelCycle]:
         """Get all active wheel cycles."""

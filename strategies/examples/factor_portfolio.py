@@ -45,6 +45,8 @@ class FactorPortfolioConfig:
     rebalance_freq: int = 21  # monthly
     momentum_lookback: int = 252
     momentum_skip: int = 21  # skip most recent month (12-1 month momentum)
+    stop_loss_pct: float = 0.05  # 5% stop loss
+    atr_stop_multiplier: float = 2.0  # ATR-based stop price multiplier
 
 
 @register_strategy("factor")
@@ -58,6 +60,8 @@ class FactorPortfolioStrategy:
     def __init__(self, config: FactorPortfolioConfig | None = None) -> None:
         self.config = config or FactorPortfolioConfig()
         self._tickers: List[str] = []
+        self._entry_prices: Dict[str, float] = {}
+        self._stop_prices: Dict[str, float] = {}
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "FactorPortfolioStrategy":
@@ -75,12 +79,46 @@ class FactorPortfolioStrategy:
         if not self._tickers:
             self._tickers = list(ctx.bars.keys())
 
+        # Check stop losses on all held positions first
+        for t in self._tickers:
+            pos = ctx.positions.get(t, 0)
+            if pos != 0 and t in ctx.bars and len(ctx.bars[t]) > 0:
+                current_price = float(ctx.bars[t]["close"].iloc[-1])
+
+                # ATR-based stop price check
+                if t in self._stop_prices:
+                    if pos > 0 and current_price < self._stop_prices[t]:
+                        signals[t] = 0
+                        self._entry_prices.pop(t, None)
+                        self._stop_prices.pop(t, None)
+                        continue
+                    elif pos < 0 and current_price > self._stop_prices[t]:
+                        signals[t] = 0
+                        self._entry_prices.pop(t, None)
+                        self._stop_prices.pop(t, None)
+                        continue
+
+                # Percentage-based stop loss check
+                if t in self._entry_prices:
+                    entry = self._entry_prices[t]
+                    if pos > 0 and current_price < entry * (1 - cfg.stop_loss_pct):
+                        signals[t] = 0
+                        self._entry_prices.pop(t, None)
+                        self._stop_prices.pop(t, None)
+                        continue
+                    elif pos < 0 and current_price > entry * (1 + cfg.stop_loss_pct):
+                        signals[t] = 0
+                        self._entry_prices.pop(t, None)
+                        self._stop_prices.pop(t, None)
+                        continue
+
         # Only rebalance on schedule
         if ctx.bar_index % cfg.rebalance_freq != 0:
-            # Maintain current positions
+            # Maintain current positions (unless stopped out above)
             for t in self._tickers:
-                pos = ctx.positions.get(t, 0)
-                signals[t] = 1 if pos > 0 else (-1 if pos < 0 else 0)
+                if t not in signals:
+                    pos = ctx.positions.get(t, 0)
+                    signals[t] = 1 if pos > 0 else (-1 if pos < 0 else 0)
             return signals
 
         # Need enough history for momentum calculation
@@ -98,23 +136,56 @@ class FactorPortfolioStrategy:
                 momentum_scores[t] = (price_recent / price_old) - 1.0
 
         if len(momentum_scores) < cfg.n_long + cfg.n_short:
-            return {t: 0 for t in self._tickers}
+            return {t: signals.get(t, 0) for t in self._tickers}
 
         # Rank and assign
-        sorted_tickers = sorted(momentum_scores, key=momentum_scores.get, reverse=True)
+        sorted_tickers = sorted(momentum_scores, key=lambda k: momentum_scores.get(k, 0.0), reverse=True)
 
         long_tickers = set(sorted_tickers[: cfg.n_long])
         short_tickers = set(sorted_tickers[-cfg.n_short:])
 
         for t in self._tickers:
+            if t in signals:
+                continue  # already stopped out
+
+            current_price = float(ctx.bars[t]["close"].iloc[-1]) if t in ctx.bars and len(ctx.bars[t]) > 0 else 0
+            prev_pos = ctx.positions.get(t, 0)
+
             if t in long_tickers:
                 signals[t] = 1
+                if prev_pos <= 0:
+                    self._entry_prices[t] = current_price
+                    # Compute ATR-based stop price
+                    atr_value = self._compute_atr(ctx.bars[t])
+                    self._stop_prices[t] = current_price - cfg.atr_stop_multiplier * atr_value
             elif t in short_tickers:
                 signals[t] = -1
+                if prev_pos >= 0:
+                    self._entry_prices[t] = current_price
+                    atr_value = self._compute_atr(ctx.bars[t])
+                    self._stop_prices[t] = current_price + cfg.atr_stop_multiplier * atr_value
             else:
                 signals[t] = 0
+                self._entry_prices.pop(t, None)
+                self._stop_prices.pop(t, None)
 
         return signals
+
+    @staticmethod
+    def _compute_atr(df: pd.DataFrame, period: int = 14) -> float:
+        """Compute ATR for stop loss calculation."""
+        if len(df) < period + 1:
+            return float(df["close"].iloc[-1]) * 0.02  # fallback 2%
+        high = df["high"]
+        low = df["low"]
+        close = df["close"]
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
+        val = float(atr.iloc[-1])
+        return val if not np.isnan(val) else float(close.iloc[-1]) * 0.02
 
     def run_backtest(
         self, universe_prices: pd.DataFrame, initial_capital: float = 100_000

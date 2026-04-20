@@ -33,10 +33,9 @@ class FeatureEngineer:
         features = pd.DataFrame(index=df.index)
         try:
             from shared.ml.regime_classifier import MLRegimeClassifier
-            clf = MLRegimeClassifier()
-            base = clf.compute_features(df)
+            base = MLRegimeClassifier.compute_features(df)
             features = features.join(base)
-        except ImportError:
+        except (ImportError, TypeError):
             close = df["close"]
             features["ret_1d"] = close.pct_change(1)
             features["ret_5d"] = close.pct_change(5)

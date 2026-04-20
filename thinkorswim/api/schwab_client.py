@@ -28,14 +28,29 @@ Usage:
 
 from __future__ import annotations
 
+import json
 import logging
+import sqlite3
+import threading
 import time
+import uuid
 from collections import deque
+from datetime import date
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
 
 logger = logging.getLogger(__name__)
+
+# --- RiskManager integration (optional, from shared module) ---
+try:
+    from shared.risk_manager import RiskManager, RiskManagerConfig
+    _HAS_RISK_MANAGER = True
+except ImportError:
+    _HAS_RISK_MANAGER = False
+    RiskManager = None  # type: ignore[assignment,misc]
+    RiskManagerConfig = None  # type: ignore[assignment,misc]
 
 
 class SchwabAPIError(Exception):
@@ -69,7 +84,13 @@ class SchwabClient:
 
     MAX_REQUESTS_PER_SECOND = 2
 
-    def __init__(self, config: Dict[str, str]) -> None:
+    def __init__(
+        self,
+        config: Dict[str, str],
+        risk_manager: Optional[Any] = None,
+        max_daily_loss: float = 5000.0,
+        persist_path: Optional[str] = None,
+    ) -> None:
         self._client_id = config["client_id"]
         self._client_secret = config["client_secret"]
         self._refresh_token = config["refresh_token"]
@@ -81,45 +102,161 @@ class SchwabClient:
         self._request_times: deque = deque()
         self._session = requests.Session()
 
+        # FIX 4: Token refresh thread safety
+        self._token_lock = threading.Lock()
+
+        # RiskManager integration
+        self._risk_manager = risk_manager
+
+        # Daily P&L tracking
+        self._daily_pnl: float = 0.0
+        self._max_daily_loss: float = max_daily_loss
+        self._daily_pnl_date: date = date.today()
+        self._consecutive_losses: int = 0
+        self._cooldown_until: float = 0.0
+
+        # SQLite state persistence
+        self._persist_path = persist_path
+        self._persist_conn: Optional[sqlite3.Connection] = None
+        self._persist_lock = threading.Lock()
+        if self._persist_path:
+            self._init_persistence(self._persist_path)
+            self._load_risk_state()
+
         self._authenticate()
         logger.info("SchwabClient initialized (account=%s)", self._account_id[:8] + "..." if self._account_id else "?")
+
+    # ─── Risk State Persistence ───
+
+    def _init_persistence(self, db_path: str) -> None:
+        """Initialize SQLite database for risk state persistence."""
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._persist_conn = sqlite3.connect(db_path, check_same_thread=False)
+        # FIX 8: SQLite WAL mode for better concurrency
+        self._persist_conn.execute("PRAGMA journal_mode=WAL")
+        self._persist_conn.execute("PRAGMA busy_timeout=5000")
+        self._persist_conn.execute(
+            "CREATE TABLE IF NOT EXISTS schwab_risk_state "
+            "(key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)"
+        )
+        self._persist_conn.commit()
+        logger.info("SchwabClient persistence initialized: %s", db_path)
+
+    def _save_risk_state(self) -> None:
+        """Persist daily P&L and cooldown state to SQLite."""
+        if self._persist_conn is None:
+            return
+
+        from datetime import datetime as _dt
+        now = _dt.now().isoformat()
+        state = {
+            "daily_pnl": self._daily_pnl,
+            "daily_pnl_date": self._daily_pnl_date.isoformat(),
+            "consecutive_losses": self._consecutive_losses,
+            "cooldown_until": self._cooldown_until,
+        }
+
+        with self._persist_lock:
+            try:
+                for key, value in state.items():
+                    self._persist_conn.execute(
+                        "INSERT OR REPLACE INTO schwab_risk_state (key, value, updated_at) "
+                        "VALUES (?, ?, ?)",
+                        (key, json.dumps(value), now),
+                    )
+                self._persist_conn.commit()
+            except Exception as e:
+                logger.error("Failed to save Schwab risk state: %s", e)
+
+    def _load_risk_state(self) -> None:
+        """Restore risk state from SQLite on startup."""
+        if self._persist_conn is None:
+            return
+
+        with self._persist_lock:
+            try:
+                rows = self._persist_conn.execute(
+                    "SELECT key, value FROM schwab_risk_state"
+                ).fetchall()
+            except Exception as e:
+                logger.error("Failed to load Schwab risk state: %s", e)
+                return
+
+        if not rows:
+            logger.info("No persisted Schwab risk state found — starting fresh")
+            return
+
+        state = {key: json.loads(value) for key, value in rows}
+
+        saved_date_str = state.get("daily_pnl_date")
+        if saved_date_str:
+            saved_date = date.fromisoformat(saved_date_str)
+            if saved_date == date.today():
+                self._daily_pnl = float(state.get("daily_pnl", 0.0))
+                self._daily_pnl_date = saved_date
+            else:
+                logger.info("Persisted Schwab state is from %s — resetting daily P&L", saved_date_str)
+
+        self._consecutive_losses = int(state.get("consecutive_losses", 0))
+        self._cooldown_until = float(state.get("cooldown_until", 0.0))
+
+        logger.info(
+            "Schwab risk state restored: daily_pnl=$%.2f, consecutive_losses=%d",
+            self._daily_pnl, self._consecutive_losses,
+        )
 
     # ─── OAuth2 Authentication ───
 
     def _authenticate(self) -> None:
-        """Exchange refresh_token for access_token."""
+        """Exchange refresh_token for access_token (thread-safe)."""
         import base64
-        credentials = base64.b64encode(
-            f"{self._client_id}:{self._client_secret}".encode()
-        ).decode()
+        with self._token_lock:
+            credentials = base64.b64encode(
+                f"{self._client_id}:{self._client_secret}".encode()
+            ).decode()
 
-        headers = {
-            "Authorization": f"Basic {credentials}",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        data = {
-            "grant_type": "refresh_token",
-            "refresh_token": self._refresh_token,
-        }
+            headers = {
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
+            data = {
+                "grant_type": "refresh_token",
+                "refresh_token": self._refresh_token,
+            }
 
-        resp = requests.post(self.AUTH_URL, headers=headers, data=data, timeout=30)
-        if resp.status_code != 200:
-            raise SchwabAPIError(
-                f"Authentication failed: {resp.text}",
-                status_code=resp.status_code, body=resp.text,
-            )
+            resp = self._session.post(self.AUTH_URL, headers=headers, data=data, timeout=30)
+            if resp.status_code != 200:
+                raise SchwabAPIError(
+                    f"Authentication failed: {resp.text}",
+                    status_code=resp.status_code, body=resp.text,
+                )
 
-        token_data = resp.json()
-        self._access_token = token_data["access_token"]
-        self._token_expiry = time.time() + token_data.get("expires_in", 1800) - 60
+            token_data = resp.json()
+            token = token_data.get("access_token")
+            if not token:
+                raise SchwabAPIError(f"Auth failed: {token_data}")
+            self._access_token = token
+            self._token_expiry = time.time() + token_data.get("expires_in", 1800) - 60
 
-        if "refresh_token" in token_data:
-            self._refresh_token = token_data["refresh_token"]
+            if "refresh_token" in token_data:
+                self._refresh_token = token_data["refresh_token"]
+                # FIX 4: Persist refresh token to disk
+                self._persist_refresh_token()
 
-        logger.info("Schwab authentication successful")
+            logger.info("Schwab authentication successful")
+
+    def _persist_refresh_token(self) -> None:
+        """Persist the current refresh token to disk."""
+        try:
+            token_path = Path.home() / ".stocks_plugin" / "schwab_refresh_token.txt"
+            token_path.parent.mkdir(parents=True, exist_ok=True)
+            token_path.write_text(self._refresh_token, encoding="utf-8")
+            logger.debug("Schwab refresh token persisted to %s", token_path)
+        except Exception as e:
+            logger.warning("Failed to persist Schwab refresh token: %s", e)
 
     def _ensure_token(self) -> None:
-        """Refresh token if expired."""
+        """Refresh token if expired (thread-safe)."""
         if time.time() >= self._token_expiry:
             logger.info("Schwab token expired, refreshing...")
             self._authenticate()
@@ -160,7 +297,7 @@ class SchwabClient:
                 method, url, headers=headers, json=json_body, params=params, timeout=30,
             )
         except requests.RequestException as e:
-            raise SchwabAPIError(f"Network error: {e}")
+            raise SchwabAPIError(f"Network error: {e}") from e
 
         if resp.status_code == 401:
             self._authenticate()
@@ -169,14 +306,17 @@ class SchwabClient:
                 method, url, headers=headers, json=json_body, params=params, timeout=30,
             )
 
-        if resp.status_code not in (200, 201):
+        if resp.status_code not in (200, 201, 204):
             raise SchwabAPIError(
                 f"API error {resp.status_code}: {resp.text}",
                 status_code=resp.status_code, body=resp.text,
             )
 
         if resp.text:
-            return resp.json()
+            try:
+                return resp.json()
+            except ValueError:
+                return {}
         return {}
 
     # ─── Market Data ───
@@ -252,6 +392,40 @@ class SchwabClient:
 
     # ─── Orders ───
 
+    def _submit_order(self, order_body: Dict[str, Any]) -> str:
+        """Submit an order and extract the order ID from the Location header.
+
+        The Schwab API returns 201 with the order ID in the Location header,
+        not in the response body.
+
+        Returns:
+            Order ID string.
+        """
+        self._rate_limit()
+        headers = self._headers()
+        url = f"{self.TRADER_URL}/accounts/{self._account_id}/orders"
+
+        try:
+            resp = self._session.post(url, headers=headers, json=order_body, timeout=30)
+        except requests.RequestException as e:
+            raise SchwabAPIError(f"Network error: {e}") from e
+
+        if resp.status_code == 401:
+            self._authenticate()
+            headers = self._headers()
+            resp = self._session.post(url, headers=headers, json=order_body, timeout=30)
+
+        if resp.status_code not in (200, 201, 204):
+            raise SchwabAPIError(
+                f"Order placement failed {resp.status_code}: {resp.text}",
+                status_code=resp.status_code, body=resp.text,
+            )
+
+        order_id = resp.headers.get("Location", "").rsplit("/", 1)[-1]
+        if not order_id:
+            order_id = uuid.uuid4().hex[:12]
+        return str(order_id)
+
     def place_market_order(self, symbol: str, action: str, quantity: int) -> str:
         """Place a market order.
 
@@ -262,52 +436,25 @@ class SchwabClient:
 
         Returns:
             Order ID.
+
+        Raises:
+            SchwabAPIError: If daily loss limit reached or RiskManager blocks the trade.
         """
-        instruction = action.upper()
-        if instruction == "SELL":
-            instruction = "SELL"
-        elif instruction == "BUY":
-            instruction = "BUY"
+        if self._daily_pnl <= -self._max_daily_loss:
+            raise SchwabAPIError(
+                f"Daily loss limit reached (P&L: ${self._daily_pnl:.2f}, limit: -${self._max_daily_loss:.2f}). "
+                "No new trades allowed. Call reset_daily_pnl() to reset."
+            )
+
+        if self._risk_manager is not None:
+            if not self._risk_manager.can_trade(symbol):
+                raise SchwabAPIError(
+                    f"RiskManager blocked trade for {symbol}"
+                )
 
         order_body = {
             "orderType": "MARKET",
             "session": "NORMAL",
-            "duration": "DAY",
-            "orderStrategyType": "SINGLE",
-            "orderLegCollection": [
-                {
-                    "instruction": instruction,
-                    "quantity": quantity,
-                    "instrument": {
-                        "symbol": symbol,
-                        "assetType": "EQUITY",
-                    },
-                }
-            ],
-        }
-
-        logger.info("Schwab: placing market %s order for %d %s", action, quantity, symbol)
-        resp = self._request(
-            "POST",
-            f"{self.TRADER_URL}/accounts/{self._account_id}/orders",
-            json_body=order_body,
-        )
-        order_id = resp.get("orderId", str(id(order_body)))
-        logger.info("Schwab market order placed: %s", order_id)
-        return str(order_id)
-
-    def place_limit_order(
-        self, symbol: str, action: str, quantity: int, price: float,
-    ) -> str:
-        """Place a limit order.
-
-        Returns:
-            Order ID.
-        """
-        order_body = {
-            "orderType": "LIMIT",
-            "session": "NORMAL",
-            "price": str(price),
             "duration": "DAY",
             "orderStrategyType": "SINGLE",
             "orderLegCollection": [
@@ -322,15 +469,73 @@ class SchwabClient:
             ],
         }
 
-        logger.info("Schwab: placing limit %s %d %s @ $%.2f", action, quantity, symbol, price)
-        resp = self._request(
-            "POST",
-            f"{self.TRADER_URL}/accounts/{self._account_id}/orders",
-            json_body=order_body,
-        )
-        order_id = resp.get("orderId", str(id(order_body)))
+        logger.info("Schwab: placing market %s order for %d %s", action, quantity, symbol)
+        order_id = self._submit_order(order_body)
+        logger.info("Schwab market order placed: %s", order_id)
+        return order_id
+
+    def place_limit_order(
+        self, symbol: str, action: str, quantity: int, price: float,
+    ) -> str:
+        """Place a limit order.
+
+        Returns:
+            Order ID.
+
+        Raises:
+            SchwabAPIError: If daily loss limit reached or RiskManager blocks the trade.
+        """
+        if self._daily_pnl <= -self._max_daily_loss:
+            raise SchwabAPIError(
+                f"Daily loss limit reached (P&L: ${self._daily_pnl:.2f}, limit: -${self._max_daily_loss:.2f}). "
+                "No new trades allowed. Call reset_daily_pnl() to reset."
+            )
+
+        if self._risk_manager is not None:
+            if not self._risk_manager.can_trade(symbol):
+                raise SchwabAPIError(
+                    f"RiskManager blocked trade for {symbol}"
+                )
+
+        order_body = {
+            "orderType": "LIMIT",
+            "session": "NORMAL",
+            "price": round(float(price), 2),
+            "duration": "DAY",
+            "orderStrategyType": "SINGLE",
+            "orderLegCollection": [
+                {
+                    "instruction": action.upper(),
+                    "quantity": quantity,
+                    "instrument": {
+                        "symbol": symbol,
+                        "assetType": "EQUITY",
+                    },
+                }
+            ],
+        }
+
+        logger.info("Schwab: placing limit %s %d %s @ $%.2f", action, quantity, symbol, order_body["price"])
+        order_id = self._submit_order(order_body)
         logger.info("Schwab limit order placed: %s", order_id)
-        return str(order_id)
+        return order_id
+
+    def place_stop_order(self, symbol: str, action: str, quantity: int, stop_price: float, account_id: str = None) -> str:
+        """Place a stop-market order via Schwab API."""
+        acct = account_id or self._account_id
+        order_body = {
+            "orderType": "STOP",
+            "session": "NORMAL",
+            "duration": "DAY",
+            "orderStrategyType": "SINGLE",
+            "stopPrice": round(float(stop_price), 2),
+            "orderLegCollection": [{
+                "instruction": action.upper(),
+                "quantity": quantity,
+                "instrument": {"symbol": symbol, "assetType": "EQUITY"}
+            }]
+        }
+        return self._submit_order(acct, order_body)
 
     def cancel_order(self, order_id: str) -> None:
         """Cancel an order."""
@@ -396,11 +601,253 @@ class SchwabClient:
                 "quantity": p.get("longQuantity", 0) - p.get("shortQuantity", 0),
                 "avg_price": p.get("averagePrice", 0),
                 "market_value": p.get("marketValue", 0),
-                "current_price": p.get("currentDayProfitLossPercentage", 0),
+                "current_price": p.get("currentPrice", p.get("marketValue", 0)),
+                "daily_pnl_pct": p.get("currentDayProfitLossPercentage", 0),
                 "pnl": p.get("currentDayProfitLoss", 0),
             }
             for p in positions
         ]
+
+    # ─── Daily P&L Tracking ───
+
+    def record_trade_pnl(self, symbol: str, pnl: float, quantity: int = 0) -> None:
+        """Record a trade's P&L and update daily tracking.
+
+        Args:
+            symbol: Ticker symbol.
+            pnl: Realized profit/loss for the trade.
+            quantity: Number of shares traded.
+        """
+        self._daily_pnl += pnl
+
+        # Consecutive loss tracking
+        if pnl < 0:
+            self._consecutive_losses += 1
+        else:
+            self._consecutive_losses = 0
+
+        logger.info(
+            "Trade P&L recorded: %s %.2f (daily total: %.2f, consecutive_losses: %d)",
+            symbol, pnl, self._daily_pnl, self._consecutive_losses,
+        )
+
+        if self._risk_manager is not None:
+            try:
+                self._risk_manager.record_trade(
+                    symbol=symbol,
+                    pnl=pnl,
+                    quantity=quantity,
+                )
+            except Exception as e:
+                logger.warning("RiskManager.record_trade failed: %s", e)
+
+        if self._daily_pnl <= -self._max_daily_loss:
+            logger.warning(
+                "DAILY LOSS LIMIT REACHED: P&L $%.2f exceeds -$%.2f. Trading halted.",
+                self._daily_pnl, self._max_daily_loss,
+            )
+
+        self._save_risk_state()
+
+    def reset_daily_pnl(self) -> None:
+        """Reset daily P&L tracking (call at start of each trading day)."""
+        logger.info("Daily P&L reset from $%.2f to $0.00", self._daily_pnl)
+        self._daily_pnl = 0.0
+
+    @property
+    def daily_pnl(self) -> float:
+        """Current daily P&L."""
+        return self._daily_pnl
+
+    @property
+    def is_trading_halted(self) -> bool:
+        """True if daily loss limit has been reached."""
+        return self._daily_pnl <= -self._max_daily_loss
+
+    # ─── Options Greeks ───
+
+    def get_option_chain(self, symbol: str, strike_count: int = 10) -> Dict[str, Any]:
+        """Fetch option chain with Greeks from Schwab API.
+
+        Args:
+            symbol: Underlying ticker symbol.
+            strike_count: Number of strikes above/below ATM to include.
+
+        Returns:
+            Dict with 'calls' and 'puts' lists, each entry containing
+            strike, expiry, bid, ask, last, volume, openInterest,
+            and greeks (delta, gamma, theta, vega, impliedVolatility).
+        """
+        params = {
+            "symbol": symbol,
+            "strikeCount": strike_count,
+            "includeUnderlyingQuote": True,
+            "strategy": "SINGLE",
+        }
+
+        resp = self._request("GET", f"{self.MARKETDATA_URL}/chains", params=params)
+
+        calls: List[Dict[str, Any]] = []
+        puts: List[Dict[str, Any]] = []
+
+        for exp_date, strikes in resp.get("callExpDateMap", {}).items():
+            for strike_str, contracts in strikes.items():
+                for c in contracts:
+                    calls.append({
+                        "symbol": c.get("symbol", ""),
+                        "strike": float(strike_str),
+                        "expiry": exp_date.split(":")[0],
+                        "bid": c.get("bid", 0),
+                        "ask": c.get("ask", 0),
+                        "last": c.get("last", 0),
+                        "volume": c.get("totalVolume", 0),
+                        "openInterest": c.get("openInterest", 0),
+                        "greeks": {
+                            "delta": c.get("delta", 0),
+                            "gamma": c.get("gamma", 0),
+                            "theta": c.get("theta", 0),
+                            "vega": c.get("vega", 0),
+                            "impliedVolatility": c.get("volatility", 0),
+                        },
+                    })
+
+        for exp_date, strikes in resp.get("putExpDateMap", {}).items():
+            for strike_str, contracts in strikes.items():
+                for c in contracts:
+                    puts.append({
+                        "symbol": c.get("symbol", ""),
+                        "strike": float(strike_str),
+                        "expiry": exp_date.split(":")[0],
+                        "bid": c.get("bid", 0),
+                        "ask": c.get("ask", 0),
+                        "last": c.get("last", 0),
+                        "volume": c.get("totalVolume", 0),
+                        "openInterest": c.get("openInterest", 0),
+                        "greeks": {
+                            "delta": c.get("delta", 0),
+                            "gamma": c.get("gamma", 0),
+                            "theta": c.get("theta", 0),
+                            "vega": c.get("vega", 0),
+                            "impliedVolatility": c.get("volatility", 0),
+                        },
+                    })
+
+        logger.info(
+            "Option chain for %s: %d calls, %d puts",
+            symbol, len(calls), len(puts),
+        )
+        return {"symbol": symbol, "calls": calls, "puts": puts}
+
+    @staticmethod
+    def _is_option_position(position: Dict[str, Any]) -> bool:
+        """Check if a position is an options position.
+
+        Args:
+            position: Position dict from get_positions().
+
+        Returns:
+            True if the position symbol matches option format (e.g. AAPL_012025C150).
+        """
+        symbol = position.get("symbol", "")
+        # Schwab option symbols contain underscores and end with C/P + strike
+        return bool(symbol) and ("_" in symbol or len(symbol) > 10)
+
+    def get_portfolio_greeks(self) -> Dict[str, Any]:
+        """Calculate aggregated portfolio Greeks across all option positions.
+
+        Fetches current positions, identifies option positions, retrieves
+        their Greeks from the option chain, and returns aggregated totals.
+
+        Returns:
+            Dict with per-position greeks and aggregated portfolio-level
+            delta, gamma, theta, and vega.
+        """
+        positions = self.get_positions()
+        option_positions = [p for p in positions if self._is_option_position(p)]
+
+        if not option_positions:
+            logger.info("No option positions found in portfolio")
+            return {
+                "positions": [],
+                "portfolio_delta": 0.0,
+                "portfolio_gamma": 0.0,
+                "portfolio_theta": 0.0,
+                "portfolio_vega": 0.0,
+            }
+
+        total_delta = 0.0
+        total_gamma = 0.0
+        total_theta = 0.0
+        total_vega = 0.0
+        position_greeks: List[Dict[str, Any]] = []
+
+        # Group by underlying symbol to minimize API calls
+        underlyings: Dict[str, List[Dict[str, Any]]] = {}
+        for pos in option_positions:
+            underlying = pos["symbol"].split("_")[0] if "_" in pos["symbol"] else pos["symbol"][:4]
+            underlyings.setdefault(underlying, []).append(pos)
+
+        for underlying, opts in underlyings.items():
+            try:
+                chain = self.get_option_chain(underlying)
+                all_contracts = chain.get("calls", []) + chain.get("puts", [])
+                contract_map = {c["symbol"]: c for c in all_contracts}
+
+                for pos in opts:
+                    contract = contract_map.get(pos["symbol"])
+                    qty = pos.get("quantity", 0)
+                    multiplier = 100
+
+                    if contract:
+                        greeks = contract.get("greeks", {})
+                        pos_delta = greeks.get("delta", 0) * qty * multiplier
+                        pos_gamma = greeks.get("gamma", 0) * qty * multiplier
+                        pos_theta = greeks.get("theta", 0) * qty * multiplier
+                        pos_vega = greeks.get("vega", 0) * qty * multiplier
+
+                        total_delta += pos_delta
+                        total_gamma += pos_gamma
+                        total_theta += pos_theta
+                        total_vega += pos_vega
+
+                        position_greeks.append({
+                            "symbol": pos["symbol"],
+                            "underlying": underlying,
+                            "quantity": qty,
+                            "delta": round(pos_delta, 4),
+                            "gamma": round(pos_gamma, 4),
+                            "theta": round(pos_theta, 4),
+                            "vega": round(pos_vega, 4),
+                            "iv": greeks.get("impliedVolatility", 0),
+                        })
+                    else:
+                        logger.warning(
+                            "Greeks not found for option position %s",
+                            pos["symbol"],
+                        )
+                        position_greeks.append({
+                            "symbol": pos["symbol"],
+                            "underlying": underlying,
+                            "quantity": qty,
+                            "delta": 0, "gamma": 0, "theta": 0, "vega": 0,
+                            "iv": 0,
+                            "warning": "contract not found in chain",
+                        })
+            except Exception as e:
+                logger.error("Failed to fetch Greeks for %s: %s", underlying, e)
+
+        result = {
+            "positions": position_greeks,
+            "portfolio_delta": round(total_delta, 4),
+            "portfolio_gamma": round(total_gamma, 4),
+            "portfolio_theta": round(total_theta, 4),
+            "portfolio_vega": round(total_vega, 4),
+        }
+        logger.info(
+            "Portfolio Greeks: Δ=%.2f Γ=%.4f Θ=%.2f ν=%.2f",
+            total_delta, total_gamma, total_theta, total_vega,
+        )
+        return result
 
     def __repr__(self) -> str:
         return f"SchwabClient(account={self._account_id[:8]}...)"

@@ -155,7 +155,7 @@ class TestBacktestEngine:
         assert isinstance(result.profit_factor, float)
         assert isinstance(result.total_return, float)
 
-    def test_max_drawdown_is_negative_or_zero(self):
+    def test_max_drawdown_is_non_negative(self):
         engine = BacktestEngine()
         df = _generate_synthetic_data(500)
         engine.load_data(df)

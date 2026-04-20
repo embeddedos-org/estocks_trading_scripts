@@ -86,6 +86,8 @@ def to_backtest_result_v2(
     """
     if not _HAS_ENGINE:
         raise ImportError("BacktestResultV2 not available")
+    if not _HAS_BT:
+        raise ImportError("backtrader is required for to_backtest_result_v2")
 
     analyzer = strategy_result.analyzers.getbytype(BacktestResultAnalyzer)
     if not analyzer:
@@ -110,7 +112,12 @@ def to_backtest_result_v2(
     sharpe = float(np.mean(returns) / np.std(returns) * np.sqrt(252)) if np.std(returns) > 0 else 0.0
 
     neg_returns = returns[returns < 0]
-    downside_std = float(np.std(neg_returns)) if len(neg_returns) > 0 else 1e-10
+    if len(neg_returns) <= 1:
+        downside_std = float(abs(neg_returns.mean())) if len(neg_returns) == 1 else 1e-10
+    else:
+        downside_std = float(np.std(neg_returns))
+    if downside_std == 0:
+        downside_std = 1e-10
     sortino = float(np.mean(returns) / downside_std * np.sqrt(252))
 
     # Drawdown
@@ -180,7 +187,7 @@ def to_backtest_result_v2(
         information_ratio=0.0,
         tracking_error=0.0,
         equity_curve=equity_series,
-        trade_log=[],
+        trade_log=trade_records,
         trades=trade_records,
         long_trades=sum(1 for t in trades if t["size"] > 0),
         short_trades=sum(1 for t in trades if t["size"] < 0),

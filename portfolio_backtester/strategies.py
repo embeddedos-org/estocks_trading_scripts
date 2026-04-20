@@ -83,6 +83,8 @@ if _HAS_BT:
         def __init__(self, lookback: int = 63):
             super().__init__()
             self.lookback = lookback
+            from portfolio_backtester.risk_parity import RiskParityEngine, RiskParityConfig
+            self._engine = RiskParityEngine(RiskParityConfig(lookback=self.lookback))
 
         def __call__(self, target):
             if target.now is None:
@@ -96,9 +98,7 @@ if _HAS_BT:
             if len(returns) < self.lookback:
                 return False
 
-            from portfolio_backtester.risk_parity import RiskParityEngine, RiskParityConfig
-            engine = RiskParityEngine(RiskParityConfig(lookback=self.lookback))
-            weights = engine.inverse_vol_weights(returns)
+            weights = self._engine.inverse_vol_weights(returns)
 
             target.temp["weights"] = weights
             return True
@@ -140,8 +140,8 @@ if _HAS_BT:
                     "volume": 1_000_000,
                 }, index=prices.index)
                 features = clf.compute_features(dummy_df)
-                if not features.empty:
-                    vol = features["vol_20d"].iloc[-1] if "vol_20d" in features.columns else 0
+                if not features.empty and "vol_20d" in features.columns:
+                    vol = features["vol_20d"].iloc[-1]
                     if vol > features["vol_20d"].quantile(0.9):
                         regime = "VOLATILE"
             except Exception:

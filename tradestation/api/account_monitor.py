@@ -3,8 +3,8 @@
 import time
 import logging
 import threading
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,9 @@ class AccountMonitor:
     Runs a background thread that periodically checks account state against
     configurable alert thresholds and dispatches notifications via an optional
     notifier (e.g. AlertDispatcher).
+
+    When drawdown or margin thresholds are breached, trading is **blocked**
+    until the condition clears or a manual override is issued.
     """
 
     def __init__(self, order_router, config: dict, notifier=None):
@@ -27,6 +30,7 @@ class AccountMonitor:
                 - max_drawdown_pct (float): Max drawdown alert threshold (default 5).
                 - position_concentration_pct (float): Single-position concentration alert (default 25).
                 - daily_summary_time (str): HH:MM UTC time for daily summary (default "21:00").
+                - auto_unblock_after_hours (int): Hours after which a block auto-expires (default 24).
             notifier: Optional object with a send(subject, message) method.
         """
         self._router = order_router
@@ -36,11 +40,58 @@ class AccountMonitor:
         self.max_drawdown_pct: float = config.get("max_drawdown_pct", 5.0)
         self.position_concentration_pct: float = config.get("position_concentration_pct", 25.0)
         self._daily_summary_time: str = config.get("daily_summary_time", "21:00")
+        self.auto_unblock_after_hours: int = config.get("auto_unblock_after_hours", 24)
 
         self._stop_event = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
         self._peak_equity: float = 0.0
         self._monitored_account: Optional[str] = None
+
+        self._trading_blocked: bool = False
+        self._block_reason: str = ""
+        self._blocked_at: Optional[datetime] = None
+
+    # ── Trading Block Gate ───────────────────────────────────────────────
+
+    def is_trading_blocked(self) -> Tuple[bool, str]:
+        """Check whether trading is currently blocked.
+
+        Auto-unblocks if the block has been active longer than
+        ``auto_unblock_after_hours``.
+
+        Returns:
+            Tuple of (is_blocked, reason).  reason is "" when not blocked.
+        """
+        if self._trading_blocked and self._blocked_at is not None:
+            elapsed = datetime.now(timezone.utc) - self._blocked_at
+            if elapsed >= timedelta(hours=self.auto_unblock_after_hours):
+                logger.info(
+                    "Auto-unblocking trading after %d hours (reason was: %s)",
+                    self.auto_unblock_after_hours,
+                    self._block_reason,
+                )
+                self._trading_blocked = False
+                self._block_reason = ""
+                self._blocked_at = None
+        return self._trading_blocked, self._block_reason
+
+    def unblock_trading(self) -> None:
+        """Manually override and clear the trading block."""
+        if self._trading_blocked:
+            logger.warning(
+                "Manual trading unblock — previous reason: %s", self._block_reason
+            )
+        self._trading_blocked = False
+        self._block_reason = ""
+        self._blocked_at = None
+
+    def _block_trading(self, reason: str) -> None:
+        """Internal helper to set the trading block."""
+        if not self._trading_blocked:
+            self._trading_blocked = True
+            self._block_reason = reason
+            self._blocked_at = datetime.now(timezone.utc)
+            logger.critical("TRADING BLOCKED — reason: %s", reason)
 
     # ── Data Retrieval ──────────────────────────────────────────────────
 
@@ -53,7 +104,8 @@ class AccountMonitor:
         data = self._router._request(
             "GET", f"/brokerage/accounts/{account_id}/balances"
         )
-        balances = data.get("Balances", [{}])[0] if isinstance(data.get("Balances"), list) else data
+        balances_list = data.get("Balances", [])
+        balances = balances_list[0] if balances_list else {}
         return {
             "cash_balance": float(balances.get("CashBalance", 0)),
             "equity": float(balances.get("Equity", 0)),
@@ -104,7 +156,7 @@ class AccountMonitor:
     # ── Alert Checks ────────────────────────────────────────────────────
 
     def _check_margin(self, balances: dict):
-        """Alert if margin usage exceeds the configured threshold."""
+        """Block trading if margin usage exceeds the configured threshold."""
         equity = balances.get("equity", 0)
         margin_used = balances.get("margin_used", 0)
         if equity > 0:
@@ -116,10 +168,11 @@ class AccountMonitor:
                     f"Margin used: ${margin_used:,.2f}, Equity: ${equity:,.2f}"
                 )
                 logger.warning(msg)
-                self._send_alert("Margin Warning", msg)
+                self._send_alert("Margin Warning — TRADING BLOCKED", msg)
+                self._block_trading("margin exceeded")
 
     def _check_drawdown(self, balances: dict):
-        """Alert if drawdown from peak equity exceeds the configured threshold."""
+        """Block trading if drawdown from peak equity exceeds the configured threshold."""
         equity = balances.get("equity", 0)
         if equity > self._peak_equity:
             self._peak_equity = equity
@@ -133,7 +186,8 @@ class AccountMonitor:
                     f"Peak: ${self._peak_equity:,.2f}, Current: ${equity:,.2f}"
                 )
                 logger.warning(msg)
-                self._send_alert("Drawdown Alert", msg)
+                self._send_alert("Drawdown Alert — TRADING BLOCKED", msg)
+                self._block_trading("drawdown exceeded")
 
     def _check_concentration(self, positions: list, equity: float):
         """Alert if any single position exceeds the concentration threshold."""
@@ -270,10 +324,13 @@ class AccountMonitor:
 
         margin_usage_pct = (margin_used / equity * 100) if equity > 0 else 0
 
+        blocked, block_reason = self.is_trading_blocked()
+
         lines = [
             "═══════════════════════════════════════════",
             f"  DAILY ACCOUNT SUMMARY — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
             f"  Account: {account_id}",
+            f"  Trading Blocked: {'YES — ' + block_reason if blocked else 'No'}",
             "═══════════════════════════════════════════",
             "",
             f"  Equity:           ${equity:>14,.2f}",

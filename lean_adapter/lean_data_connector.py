@@ -16,7 +16,6 @@ import logging
 import os
 from typing import Optional
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -34,7 +33,14 @@ class LEANDataBridge:
         """
         df = pd.read_csv(path, header=None,
                         names=["date", "open", "high", "low", "close", "volume"])
-        df["date"] = pd.to_datetime(df["date"].astype(str).str.strip(), format="%Y%m%d 00:00")
+        date_str = df["date"].astype(str).str.strip()
+        try:
+            df["date"] = pd.to_datetime(date_str, format="%Y%m%d 00:00")
+        except (ValueError, TypeError):
+            try:
+                df["date"] = pd.to_datetime(date_str, format="%Y%m%d")
+            except (ValueError, TypeError):
+                df["date"] = pd.to_datetime(date_str, infer_datetime_format=True)
         df = df.set_index("date")
         for col in ["open", "high", "low", "close"]:
             df[col] = df[col] / 10000.0
@@ -49,10 +55,10 @@ class LEANDataBridge:
             lean_df["date"] = df.index.strftime("%Y%m%d 00:00")
         else:
             lean_df["date"] = df.index
-        lean_df["open"] = (df["open"] * 10000).astype(int)
-        lean_df["high"] = (df["high"] * 10000).astype(int)
-        lean_df["low"] = (df["low"] * 10000).astype(int)
-        lean_df["close"] = (df["close"] * 10000).astype(int)
+        lean_df["open"] = (df["open"] * 10000).round().astype(int)
+        lean_df["high"] = (df["high"] * 10000).round().astype(int)
+        lean_df["low"] = (df["low"] * 10000).round().astype(int)
+        lean_df["close"] = (df["close"] * 10000).round().astype(int)
         lean_df["volume"] = df["volume"].astype(int)
         lean_df.to_csv(output_path, index=False, header=False)
         logger.info("Written LEAN CSV: %s (%d bars)", output_path, len(lean_df))

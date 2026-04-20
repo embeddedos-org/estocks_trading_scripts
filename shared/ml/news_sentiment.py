@@ -215,7 +215,7 @@ class NewsSentimentAnalyzer:
         neutral = [s for s in scored if -0.1 <= s["score"] <= 0.1]
 
         # Confidence: based on agreement and sample size
-        agreement = 1.0 - std_score  # low variance = high agreement
+        agreement = max(0.0, 1.0 - std_score)  # low variance = high agreement
         sample_factor = min(len(scored) / 10, 1.0)  # more headlines = more confident
         confidence = max(0.0, min(1.0, agreement * sample_factor))
 

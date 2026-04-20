@@ -133,11 +133,24 @@ class MomentumRebalancer:
         cfg = self.config
         scores: List[MomentumScore] = []
 
-        data = self.fetcher.fetch_multiple(
-            self.universe,
-            duration=cfg.lookback_duration,
-            bar_size=cfg.bar_size,
-        )
+        if hasattr(self.fetcher, 'fetch_multiple'):
+            data = self.fetcher.fetch_multiple(
+                self.universe,
+                duration=cfg.lookback_duration,
+                bar_size=cfg.bar_size,
+            )
+        else:
+            data = {}
+            for sym in self.universe:
+                try:
+                    data[sym] = self.fetcher.fetch(
+                        sym,
+                        duration=cfg.lookback_duration,
+                        bar_size=cfg.bar_size,
+                    )
+                except Exception as e:
+                    logger.warning("Failed to fetch data for %s: %s", sym, e)
+                    data[sym] = pd.DataFrame()
 
         for symbol, df in data.items():
             if df.empty or len(df) < 130:
@@ -256,13 +269,21 @@ class MomentumRebalancer:
             n = len(selected)
             target_weights = {s.symbol: 1.0 / n for s in selected} if n > 0 else {}
         else:
-            target_weights = {s.symbol: 1.0 / len(selected) for s in selected}
+            total_score = sum(s.composite_score for s in selected)
+            if total_score > 0:
+                target_weights = {s.symbol: s.composite_score / total_score for s in selected}
+            else:
+                n = len(selected)
+                target_weights = {s.symbol: 1.0 / n for s in selected} if n > 0 else {}
 
         # Calculate target shares
         target_shares: Dict[str, int] = {}
         for symbol, weight in target_weights.items():
             dollar_amount = cfg.total_capital * weight
-            price = prices.get(symbol, 1.0)
+            price = prices.get(symbol)
+            if price is None:
+                logger.warning("No price for %s, skipping", symbol)
+                continue
             target_shares[symbol] = int(dollar_amount / price) if price > 0 else 0
 
         orders: List[RebalanceOrder] = []

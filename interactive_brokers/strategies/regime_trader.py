@@ -148,6 +148,7 @@ class RegimeTrader:
 
         dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
         adx = dx.ewm(alpha=1.0 / length, min_periods=length).mean()
+        adx = adx.fillna(0)
 
         return adx
 
@@ -216,7 +217,8 @@ class RegimeTrader:
                     "RANGING": MarketRegime.RANGING,
                     "VOLATILE": MarketRegime.VOLATILE,
                 }
-                regime = regime_map.get(ml_regime.name, MarketRegime.UNKNOWN)
+                ml_regime_name = ml_regime if isinstance(ml_regime, str) else ml_regime.name
+                regime = regime_map.get(ml_regime_name, MarketRegime.UNKNOWN)
 
                 if regime != self._current_regime:
                     logger.info(

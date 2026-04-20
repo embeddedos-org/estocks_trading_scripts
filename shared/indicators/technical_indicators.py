@@ -717,6 +717,60 @@ class TechnicalIndicators:
         return result
 
     @staticmethod
+    def squeeze(
+        df: pd.DataFrame,
+        bb_length: int = 20,
+        bb_mult: float = 2.0,
+        kc_length: int = 20,
+        kc_mult: float = 1.5,
+    ) -> pd.DataFrame:
+        """Bollinger Band Squeeze detector (BB inside Keltner Channel).
+
+        Returns DataFrame with columns: squeeze_on, squeeze_off, momentum,
+        bb_upper, bb_lower, kc_upper, kc_lower.
+
+        squeeze_on = True when BB is inside KC (low volatility, compression).
+        squeeze_off = True when BB breaks outside KC (volatility expansion).
+        """
+        # Bollinger Bands
+        bb_mid = df["close"].rolling(bb_length).mean()
+        bb_std = df["close"].rolling(bb_length).std()
+        bb_upper = bb_mid + bb_mult * bb_std
+        bb_lower = bb_mid - bb_mult * bb_std
+
+        # Keltner Channels
+        tr = pd.concat([
+            df["high"] - df["low"],
+            abs(df["high"] - df["close"].shift(1)),
+            abs(df["low"] - df["close"].shift(1)),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(kc_length).mean()
+        kc_mid = df["close"].rolling(kc_length).mean()
+        kc_upper = kc_mid + kc_mult * atr
+        kc_lower = kc_mid - kc_mult * atr
+
+        # Squeeze detection
+        squeeze_on = (bb_lower > kc_lower) & (bb_upper < kc_upper)
+        squeeze_off = ~squeeze_on
+
+        # Momentum (linear regression of close - midline)
+        midline = (
+            df["high"].rolling(kc_length).max() + df["low"].rolling(kc_length).min()
+        ) / 2
+        momentum = df["close"] - (midline + kc_mid) / 2
+
+        result = pd.DataFrame({
+            "squeeze_on": squeeze_on,
+            "squeeze_off": squeeze_off,
+            "momentum": momentum,
+            "bb_upper": bb_upper,
+            "bb_lower": bb_lower,
+            "kc_upper": kc_upper,
+            "kc_lower": kc_lower,
+        }, index=df.index)
+        return result
+
+    @staticmethod
     def pivot_points(df: pd.DataFrame, method: str = "standard") -> pd.DataFrame:
         """Pivot Points (standard, fibonacci, camarilla).
 

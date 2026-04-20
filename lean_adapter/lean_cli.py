@@ -19,7 +19,6 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -96,10 +95,13 @@ class LEANCLIRunner:
 
     def _parse_lean_results(self, results_dir: str) -> Any:
         """Parse LEAN backtest results JSON into BacktestResultV2."""
+        expanded_dir = os.path.expanduser(results_dir)
+        if not os.path.isdir(expanded_dir):
+            return {}
         results_file = None
-        for f in os.listdir(os.path.expanduser(results_dir)):
+        for f in os.listdir(expanded_dir):
             if f.endswith(".json") and "backtest" in f.lower():
-                results_file = os.path.join(os.path.expanduser(results_dir), f)
+                results_file = os.path.join(expanded_dir, f)
                 break
 
         if results_file is None:
@@ -108,31 +110,44 @@ class LEANCLIRunner:
         with open(results_file) as f:
             data = json.load(f)
 
+        def _safe_float(val: str, scale: float = 1.0) -> float:
+            """Parse a string to float, stripping '%' and scaling. Returns 0.0 on failure."""
+            try:
+                return float(val.replace("%", "")) * scale
+            except (ValueError, AttributeError):
+                return 0.0
+
+        def _safe_int(val: str) -> int:
+            try:
+                return int(val)
+            except (ValueError, TypeError):
+                return 0
+
         stats = data.get("Statistics", {})
-        total_return = float(stats.get("Total Net Profit", "0").replace("%", "")) / 100
-        sharpe = float(stats.get("Sharpe Ratio", "0"))
-        max_dd = float(stats.get("Drawdown", "0").replace("%", "")) / -100
+        total_return = _safe_float(stats.get("Total Net Profit", "0"), 0.01)
+        sharpe = _safe_float(stats.get("Sharpe Ratio", "0"))
+        max_dd = _safe_float(stats.get("Drawdown", "0"), -0.01)
 
         if _HAS_ENGINE:
             return BacktestResultV2(
                 total_return=total_return,
-                cagr=float(stats.get("Compounding Annual Return", "0").replace("%", "")) / 100,
+                cagr=_safe_float(stats.get("Compounding Annual Return", "0"), 0.01),
                 sharpe_ratio=sharpe,
-                sortino_ratio=float(stats.get("Sortino Ratio", "0")),
+                sortino_ratio=_safe_float(stats.get("Sortino Ratio", "0")),
                 max_drawdown=max_dd,
                 calmar_ratio=0.0,
-                win_rate=float(stats.get("Win Rate", "0").replace("%", "")) / 100,
-                profit_factor=float(stats.get("Profit-Loss Ratio", "0")),
-                total_trades=int(stats.get("Total Trades", "0")),
-                expectancy=float(stats.get("Expectation", "0")),
+                win_rate=_safe_float(stats.get("Win Rate", "0"), 0.01),
+                profit_factor=_safe_float(stats.get("Profit-Loss Ratio", "0")),
+                total_trades=_safe_int(stats.get("Total Trades", "0")),
+                expectancy=_safe_float(stats.get("Expectation", "0")),
                 avg_trade_duration=0.0,
                 max_consecutive_wins=0,
                 max_consecutive_losses=0,
                 monthly_returns=pd.Series(dtype=float),
-                alpha=float(stats.get("Alpha", "0")),
-                beta=float(stats.get("Beta", "0")),
-                information_ratio=float(stats.get("Information Ratio", "0")),
-                tracking_error=float(stats.get("Tracking Error", "0")),
+                alpha=_safe_float(stats.get("Alpha", "0")),
+                beta=_safe_float(stats.get("Beta", "0")),
+                information_ratio=_safe_float(stats.get("Information Ratio", "0")),
+                tracking_error=_safe_float(stats.get("Tracking Error", "0")),
                 equity_curve=pd.Series(dtype=float),
                 trade_log=[],
                 trades=[],

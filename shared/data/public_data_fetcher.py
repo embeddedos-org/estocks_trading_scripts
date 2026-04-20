@@ -13,14 +13,19 @@ Used by:
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".stocks_plugin", "cache")
 
 # ─── NYSE market hours (Eastern) ─────────────────────────────────────────────
 _MARKET_OPEN_HOUR_ET = 9
@@ -41,11 +46,27 @@ class PublicDataFetcher:
         self,
         cache_enabled: bool = True,
         cache_ttl_seconds: int = 300,
+        cache_persist_path: Optional[str] = None,
     ) -> None:
         self._cache_enabled = cache_enabled
         self._cache_ttl = cache_ttl_seconds
         self._ohlcv_cache: Dict[str, Dict[str, Any]] = {}
         self._news_cache: Dict[str, Dict[str, Any]] = {}
+
+        # Fix 9: yfinance rate limiting — minimum 0.5s between calls
+        self._last_fetch_time: float = 0.0
+        self._min_fetch_interval: float = 0.5
+
+        # FIX 10: Data fetcher circuit breaker
+        self._consecutive_failures: int = 0
+        self._max_failures: int = 5
+
+        # Fix 18: cache persistence path
+        if cache_persist_path is None:
+            self._cache_persist_path = os.path.join(_CACHE_DIR, "data_cache.json")
+        else:
+            self._cache_persist_path = cache_persist_path
+        self._load_cache_from_disk()
 
     # ─── OHLCV ───────────────────────────────────────────────────────────────
 
@@ -77,11 +98,30 @@ class PublicDataFetcher:
 
         try:
             import yfinance as yf
+
+            # FIX 10: Circuit breaker — if too many consecutive failures, use cached data
+            if self._consecutive_failures >= self._max_failures:
+                logger.critical(
+                    "Data fetcher circuit breaker OPEN: %d consecutive failures for %s. "
+                    "Using cached data if available.",
+                    self._consecutive_failures, symbol,
+                )
+                cached_fallback = self._ohlcv_cache.get(cache_key)
+                if cached_fallback:
+                    return cached_fallback["df"]
+                # Exponential backoff before retry
+                backoff = min(2 ** self._consecutive_failures, 60)
+                time.sleep(backoff)
+
+            # Fix 9: enforce minimum gap between yfinance API calls
+            self._rate_limit_fetch()
+
             ticker = yf.Ticker(symbol)
             df = ticker.history(period=period, interval=interval, auto_adjust=True)
 
             if df is None or df.empty:
                 logger.warning("No OHLCV data for %s (period=%s, interval=%s)", symbol, period, interval)
+                self._consecutive_failures += 1
                 return None
 
             # Normalise column names to lowercase
@@ -98,23 +138,56 @@ class PublicDataFetcher:
 
             df = df.dropna(subset=["close"])
 
+            # FIX 11: Validate data before returning
+            df = self._validate_data(df, symbol)
+
             if self._cache_enabled:
                 self._ohlcv_cache[cache_key] = {"df": df, "ts": time.time()}
+
+            # FIX 10: Reset failure counter on success
+            self._consecutive_failures = 0
 
             logger.debug("Fetched %d bars for %s", len(df), symbol)
             return df
 
         except Exception as e:
             logger.error("Failed to fetch OHLCV for %s: %s", symbol, e)
+            # FIX 10: Increment failure counter, use cached data on failure
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= self._max_failures:
+                logger.critical(
+                    "Data fetcher: %d consecutive failures. Check data source connectivity.",
+                    self._consecutive_failures,
+                )
+            # Return stale cached data if available
+            cached_fallback = self._ohlcv_cache.get(cache_key)
+            if cached_fallback:
+                logger.warning("Returning stale cached data for %s", symbol)
+                return cached_fallback["df"]
             return None
 
     def fetch_latest_price(self, symbol: str) -> float:
         """Return the most recent close price for a symbol.
 
-        Returns 0.0 on failure so callers can check ``price > 0``.
+        Returns 0.0 on failure so callers can check ``price > 0``
+        before using the value in calculations.
+
+        .. warning::
+            A return value of 0.0 means the price could not be fetched.
+            Callers MUST guard against 0.0 to avoid division-by-zero
+            or placing $0 orders::
+
+                price = fetcher.fetch_latest_price("AAPL")
+                if price <= 0:
+                    logger.warning("Skipping — could not fetch price for AAPL")
+                    return
         """
         try:
             import yfinance as yf
+
+            # Fix 9: enforce minimum gap between yfinance API calls
+            self._rate_limit_fetch()
+
             ticker = yf.Ticker(symbol)
             info = ticker.fast_info
             price = getattr(info, "last_price", None) or getattr(info, "regularMarketPrice", None)
@@ -127,6 +200,129 @@ class PublicDataFetcher:
         except Exception as e:
             logger.warning("fetch_latest_price(%s) failed: %s", symbol, e)
         return 0.0
+
+    # ─── FIX 11: Data Validation ─────────────────────────────────────────────
+
+    def _validate_data(self, df: pd.DataFrame, symbol: str) -> pd.DataFrame:
+        """Validate OHLCV data and drop invalid rows.
+
+        Checks:
+        - Prices must be > 0
+        - Volume must be >= 0
+        - Dates must be sorted
+        - No duplicate timestamps
+
+        Args:
+            df: Raw OHLCV DataFrame.
+            symbol: Symbol for logging.
+
+        Returns:
+            Cleaned DataFrame.
+        """
+        initial_len = len(df)
+
+        # Drop rows with non-positive prices
+        price_cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
+        for col in price_cols:
+            bad_mask = df[col] <= 0
+            if bad_mask.any():
+                logger.warning(
+                    "Data validation [%s]: dropping %d rows with %s <= 0",
+                    symbol, bad_mask.sum(), col,
+                )
+                df = df[~bad_mask]
+
+        # Drop rows with negative volume
+        if "volume" in df.columns:
+            bad_vol = df["volume"] < 0
+            if bad_vol.any():
+                logger.warning(
+                    "Data validation [%s]: dropping %d rows with negative volume",
+                    symbol, bad_vol.sum(),
+                )
+                df = df[~bad_vol]
+
+        # Remove duplicate timestamps
+        if df.index.duplicated().any():
+            dup_count = df.index.duplicated().sum()
+            logger.warning(
+                "Data validation [%s]: removing %d duplicate timestamps",
+                symbol, dup_count,
+            )
+            df = df[~df.index.duplicated(keep="last")]
+
+        # Ensure dates are sorted
+        if not df.index.is_monotonic_increasing:
+            logger.warning("Data validation [%s]: sorting unsorted dates", symbol)
+            df = df.sort_index()
+
+        if len(df) < initial_len:
+            logger.info(
+                "Data validation [%s]: %d → %d rows after cleanup",
+                symbol, initial_len, len(df),
+            )
+
+        return df
+
+    # ─── Rate Limiting (Fix 9) ─────────────────────────────────────────────
+
+    def _rate_limit_fetch(self) -> None:
+        """Enforce minimum 0.5s gap between yfinance API calls."""
+        now = time.time()
+        elapsed = now - self._last_fetch_time
+        if elapsed < self._min_fetch_interval:
+            time.sleep(self._min_fetch_interval - elapsed)
+        self._last_fetch_time = time.time()
+
+    # ─── Cache Persistence (Fix 18) ────────────────────────────────────────
+
+    def save_cache_to_disk(self) -> None:
+        """Persist in-memory cache metadata to disk for session recovery.
+
+        Only saves cache keys and timestamps — actual DataFrames are
+        not serialised because pickle is fragile across versions.  On
+        reload the cache will be populated lazily.
+        """
+        if not self._cache_enabled:
+            return
+        try:
+            os.makedirs(os.path.dirname(self._cache_persist_path), exist_ok=True)
+            meta = {
+                "ohlcv_keys": {
+                    k: {"ts": v["ts"]} for k, v in self._ohlcv_cache.items()
+                },
+                "news_keys": {
+                    k: {"ts": v["ts"]} for k, v in self._news_cache.items()
+                },
+                "saved_at": time.time(),
+            }
+            with open(self._cache_persist_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            logger.info("Data cache metadata saved to %s", self._cache_persist_path)
+        except Exception as e:
+            logger.warning("Failed to save cache metadata: %s", e)
+
+    def _load_cache_from_disk(self) -> None:
+        """Reload cache metadata from disk on startup.
+
+        Fresh data will be fetched lazily on the next access.
+        """
+        if not self._cache_enabled or not os.path.exists(self._cache_persist_path):
+            return
+        try:
+            with open(self._cache_persist_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            saved_at = meta.get("saved_at", 0)
+            age = time.time() - saved_at
+            logger.info(
+                "Cache metadata loaded from %s (age=%.0fs, ohlcv_keys=%d, news_keys=%d)",
+                self._cache_persist_path,
+                age,
+                len(meta.get("ohlcv_keys", {})),
+                len(meta.get("news_keys", {})),
+            )
+        except Exception as e:
+            logger.debug("Failed to load cache metadata: %s", e)
 
     # ─── News Headlines ───────────────────────────────────────────────────────
 
@@ -182,6 +378,7 @@ class PublicDataFetcher:
         """Fetch news from Yahoo Finance via yfinance."""
         try:
             import yfinance as yf
+            self._rate_limit_fetch()
             ticker = yf.Ticker(symbol)
             news = ticker.news or []
             results = []

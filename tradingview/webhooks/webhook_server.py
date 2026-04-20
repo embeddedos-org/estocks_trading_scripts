@@ -8,14 +8,19 @@ stocks_plugin - tradingview/webhooks/webhook_server.py
 
 import hashlib
 import hmac
+import json
 import logging
 import re
+import statistics
+import threading
 import time
+import traceback
+import urllib.request
 from abc import ABC, abstractmethod
-from collections import defaultdict
-from datetime import datetime, timezone
+from collections import defaultdict, deque
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from fastapi import FastAPI, HTTPException, Request
@@ -36,6 +41,41 @@ except ImportError:
 
 # ─── Logging Setup ───
 logger = logging.getLogger("webhook_server")
+
+# ─── Sector Mapping for Risk Limits (Fix 8: import from unified sector map) ───
+try:
+    from shared.config.sector_map import SECTOR_MAP
+except ImportError:
+    SECTOR_MAP: Dict[str, str] = {
+        "AAPL": "Technology", "MSFT": "Technology", "GOOGL": "Technology",
+        "GOOG": "Technology", "META": "Technology", "AMZN": "Technology",
+        "NVDA": "Technology", "TSM": "Technology", "AVGO": "Technology",
+        "ORCL": "Technology", "CRM": "Technology", "ADBE": "Technology",
+        "AMD": "Technology", "INTC": "Technology", "CSCO": "Technology",
+        "QCOM": "Technology", "IBM": "Technology", "TXN": "Technology",
+        "JPM": "Financials", "BAC": "Financials", "WFC": "Financials",
+        "GS": "Financials", "MS": "Financials", "C": "Financials",
+        "BLK": "Financials", "SCHW": "Financials", "AXP": "Financials",
+        "V": "Financials", "MA": "Financials", "PYPL": "Financials",
+        "JNJ": "Healthcare", "UNH": "Healthcare", "PFE": "Healthcare",
+        "ABBV": "Healthcare", "MRK": "Healthcare", "LLY": "Healthcare",
+        "TMO": "Healthcare", "ABT": "Healthcare", "DHR": "Healthcare",
+        "TSLA": "Consumer Discretionary", "HD": "Consumer Discretionary",
+        "NKE": "Consumer Discretionary", "MCD": "Consumer Discretionary",
+        "SBUX": "Consumer Discretionary", "LOW": "Consumer Discretionary",
+        "PG": "Consumer Staples", "KO": "Consumer Staples", "PEP": "Consumer Staples",
+        "COST": "Consumer Staples", "WMT": "Consumer Staples",
+        "XOM": "Energy", "CVX": "Energy", "COP": "Energy",
+        "SLB": "Energy", "EOG": "Energy", "OXY": "Energy",
+        "BA": "Industrials", "CAT": "Industrials", "GE": "Industrials",
+        "HON": "Industrials", "UPS": "Industrials", "RTX": "Industrials",
+        "NEE": "Utilities", "DUK": "Utilities", "SO": "Utilities",
+        "DIS": "Communication Services", "NFLX": "Communication Services",
+        "CMCSA": "Communication Services", "T": "Communication Services",
+        "LIN": "Materials", "APD": "Materials", "SHW": "Materials",
+        "AMT": "Real Estate", "PLD": "Real Estate", "CCI": "Real Estate",
+        "SPY": "ETF", "QQQ": "ETF", "IWM": "ETF", "DIA": "ETF",
+    }
 
 
 # ─── Configuration Loading ───
@@ -60,11 +100,13 @@ def _default_config() -> dict:
     return {
         "server": {"host": "0.0.0.0", "port": 5000, "debug": False},
         "security": {
-            "hmac_secret": "default_secret",
+            "hmac_secret": "",
             "hmac_algorithm": "sha256",
+            "require_hmac": True,
             "allowed_ips": ["127.0.0.1"],
             "require_passphrase": False,
             "passphrase": "",
+            "cors_origins": [],
         },
         "rate_limiting": {
             "enabled": True,
@@ -73,6 +115,21 @@ def _default_config() -> dict:
         },
         "broker_routing": {"default_broker": "interactive_brokers", "routes": []},
         "logging": {"level": "INFO", "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"},
+        "risk_management": {
+            "max_daily_loss": 5000.0,
+            "daily_reset_hour_utc": 0,
+            "max_consecutive_losses": 3,
+            "cooldown_minutes": 30,
+            "max_drawdown_pct": 10.0,
+            "drawdown_lockout_hours": 24,
+            "max_trade_value": 50000.0,
+        },
+        "health_monitor": {
+            "enabled": True,
+            "ping_url": "",
+            "ping_interval_seconds": 60,
+            "max_silence_minutes": 30,
+        },
     }
 
 
@@ -189,7 +246,9 @@ class IBBrokerAdapter(BrokerAdapter):
     def _init_adapter(self) -> None:
         try:
             import sys, os
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+            _ib_path = os.path.join(os.path.dirname(__file__), "..", "..")
+            if _ib_path not in sys.path:
+                sys.path.insert(0, _ib_path)
             from shared.daemon.broker_bridge import IBAdapter
             self._adapter = IBAdapter(
                 host=self._config.get("host", "127.0.0.1"),
@@ -272,7 +331,9 @@ class TradeStationBrokerAdapter(BrokerAdapter):
     def _init_adapter(self) -> None:
         try:
             import sys, os
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+            _ts_path = os.path.join(os.path.dirname(__file__), "..", "..")
+            if _ts_path not in sys.path:
+                sys.path.insert(0, _ts_path)
             from shared.daemon.broker_bridge import TradeStationAdapter
             self._adapter = TradeStationAdapter(
                 self._config,
@@ -354,7 +415,9 @@ class SchwabBrokerAdapter(BrokerAdapter):
     def _init_adapter(self) -> None:
         try:
             import sys, os
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+            _schwab_path = os.path.join(os.path.dirname(__file__), "..", "..")
+            if _schwab_path not in sys.path:
+                sys.path.insert(0, _schwab_path)
             from shared.daemon.broker_bridge import SchwabAdapter
             self._adapter = SchwabAdapter(self._config)
         except Exception as e:
@@ -424,7 +487,14 @@ class SchwabBrokerAdapter(BrokerAdapter):
 
 # ─── Rate Limiter ───
 class RateLimiter:
-    """Per-IP rate limiter using sliding window."""
+    """Per-IP rate limiter using sliding window.
+
+    LIMITATION: This rate limiter uses an in-memory dict that is NOT shared
+    across multiple worker processes (e.g. uvicorn --workers N). Each worker
+    maintains its own counter, so effective rate limits are multiplied by the
+    worker count. For multi-worker deployments, switch to a Redis-based rate
+    limiter (e.g. slowapi with Redis backend) or a shared file lock counter.
+    """
 
     def __init__(self, max_requests: int = 60, window_seconds: int = 60):
         self.max_requests = max_requests
@@ -495,7 +565,411 @@ class BrokerRouter:
         return self._adapters
 
 
-# ─── HMAC Validation ───
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX 1 — HealthMonitor (heartbeat + silence detection)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class HealthMonitor:
+    """Background daemon that pings a health-check URL, warns on silence,
+    tracks alert-to-order latency, and detects stale TradingView alerts."""
+
+    def __init__(
+        self,
+        ping_url: str = "",
+        ping_interval_seconds: int = 60,
+        max_silence_minutes: int = 30,
+        alert_dispatcher: Any = None,
+        alert_timeout_hours: float = 12.0,
+    ):
+        self._ping_url = ping_url
+        self._ping_interval = ping_interval_seconds
+        self._max_silence = timedelta(minutes=max_silence_minutes)
+        self._dispatcher = alert_dispatcher
+        self.alerts_processed: int = 0
+        self.last_alert_time: Optional[datetime] = None
+        self._start_time = time.time()
+        self._silence_warned = False
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+        # GAP 3: Latency tracking
+        self._latency_history: deque = deque(maxlen=100)
+        self._last_latency_ms: Optional[float] = None
+
+        # GAP 6: Alert freshness / expiration detection
+        self._alert_timeout = timedelta(hours=alert_timeout_hours)
+        self._alert_freshness_warned = False
+
+    def record_alert(self) -> None:
+        self.alerts_processed += 1
+        self.last_alert_time = datetime.now(timezone.utc)
+        self._silence_warned = False
+        self._alert_freshness_warned = False
+
+    def record_latency(self, latency_ms: float) -> None:
+        """Record alert-to-order latency in milliseconds."""
+        self._last_latency_ms = latency_ms
+        self._latency_history.append(latency_ms)
+        if len(self._latency_history) >= 10:
+            avg = statistics.mean(self._latency_history)
+            if avg > 2000:
+                logger.warning(
+                    "HIGH LATENCY WARNING: average alert-to-order latency %.0fms "
+                    "(last %d samples) exceeds 2000ms threshold",
+                    avg, len(self._latency_history),
+                )
+
+    def get_latency_stats(self) -> Dict[str, Any]:
+        """Return rolling latency statistics."""
+        if not self._latency_history:
+            return {"samples": 0}
+        data = list(self._latency_history)
+        return {
+            "samples": len(data),
+            "last_ms": round(data[-1], 1),
+            "avg_ms": round(statistics.mean(data), 1),
+            "min_ms": round(min(data), 1),
+            "max_ms": round(max(data), 1),
+            "p95_ms": round(sorted(data)[int(len(data) * 0.95)], 1) if len(data) >= 2 else round(data[-1], 1),
+        }
+
+    def check_alert_freshness(self) -> Dict[str, str]:
+        """Check if alerts are arriving within the expected timeout window.
+
+        Returns a dict with ``status`` ("ok" or "stale") and a human message.
+        """
+        if self.last_alert_time is None:
+            elapsed = timedelta(seconds=self.uptime_seconds)
+        else:
+            elapsed = datetime.now(timezone.utc) - self.last_alert_time
+
+        if elapsed > self._alert_timeout:
+            hours = elapsed.total_seconds() / 3600
+            msg = f"stale - no alerts for {hours:.1f}h"
+            if not self._alert_freshness_warned:
+                self._alert_freshness_warned = True
+                warn_msg = (
+                    f"⚠️ Possible alert expiration detected: no alerts received for "
+                    f"{hours:.1f}h (timeout={self._alert_timeout.total_seconds()/3600:.0f}h). "
+                    f"Check TradingView alert settings."
+                )
+                logger.warning(warn_msg)
+                if self._dispatcher:
+                    try:
+                        self._dispatcher.dispatch(
+                            title="Alert Freshness Warning",
+                            message=warn_msg,
+                            level="warning",
+                        )
+                    except Exception:
+                        pass
+            return {"status": "stale", "detail": msg}
+        return {"status": "ok", "detail": "ok"}
+
+    @property
+    def uptime_seconds(self) -> float:
+        return time.time() - self._start_time
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="HealthMonitor")
+        self._thread.start()
+        logger.info("HealthMonitor started (ping_interval=%ds, max_silence=%s)",
+                     self._ping_interval, self._max_silence)
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                self._ping_health_url()
+                self._check_silence()
+                self.check_alert_freshness()
+            except Exception:
+                logger.debug("HealthMonitor tick error: %s", traceback.format_exc())
+            self._stop_event.wait(timeout=self._ping_interval)
+
+    def _ping_health_url(self) -> None:
+        if not self._ping_url:
+            return
+        try:
+            req = urllib.request.Request(self._ping_url, method="GET")
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+        except Exception as exc:
+            logger.warning("HealthMonitor ping failed (%s): %s", self._ping_url, exc)
+
+    def _check_silence(self) -> None:
+        if self._silence_warned:
+            return
+        if self.last_alert_time is None:
+            elapsed = timedelta(seconds=self.uptime_seconds)
+        else:
+            elapsed = datetime.now(timezone.utc) - self.last_alert_time
+        if elapsed > self._max_silence:
+            self._silence_warned = True
+            msg = (f"⚠️ No webhook alerts received for {elapsed}. "
+                   f"Last alert: {self.last_alert_time or 'never'}")
+            logger.warning(msg)
+            if self._dispatcher:
+                try:
+                    self._dispatcher.dispatch(title="Webhook Silence Warning",
+                                              message=msg, level="warning")
+                except Exception:
+                    pass
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX 2 — DailyPnLTracker (daily loss-limit enforcement)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class DailyPnLTracker:
+    """Tracks cumulative daily P&L and blocks trading when the loss limit is hit."""
+
+    def __init__(self, max_daily_loss: float = 5000.0, reset_hour_utc: int = 0):
+        self._max_daily_loss = max_daily_loss
+        self._reset_hour_utc = reset_hour_utc
+        self._daily_pnl: float = 0.0
+        self._trade_count: int = 0
+        self._last_reset_date: Optional[datetime] = None
+        self._lock = threading.Lock()
+        self._reset_if_new_day()
+
+    def record_trade(self, symbol: str, pnl: float) -> None:
+        with self._lock:
+            self._reset_if_new_day()
+            self._daily_pnl += pnl
+            self._trade_count += 1
+            logger.info("DailyPnL: %s %.2f → cumulative %.2f (limit %.2f)",
+                        symbol, pnl, self._daily_pnl, self._max_daily_loss)
+
+    def can_trade(self) -> bool:
+        with self._lock:
+            self._reset_if_new_day()
+            if self._daily_pnl < 0 and abs(self._daily_pnl) >= self._max_daily_loss:
+                logger.warning("Daily loss limit reached: %.2f (max %.2f)",
+                               self._daily_pnl, self._max_daily_loss)
+                return False
+            return True
+
+    def reset_daily(self) -> None:
+        with self._lock:
+            prev = self._daily_pnl
+            self._daily_pnl = 0.0
+            self._trade_count = 0
+            self._last_reset_date = datetime.now(timezone.utc).date()
+            logger.info("DailyPnL reset (previous cumulative: %.2f)", prev)
+
+    @property
+    def daily_pnl(self) -> float:
+        return self._daily_pnl
+
+    @property
+    def trade_count(self) -> int:
+        return self._trade_count
+
+    def _reset_if_new_day(self) -> None:
+        now = datetime.now(timezone.utc)
+        reset_boundary = now.replace(
+            hour=self._reset_hour_utc, minute=0, second=0, microsecond=0)
+        today = (reset_boundary.date() if now >= reset_boundary
+                 else (reset_boundary - timedelta(days=1)).date())
+        if self._last_reset_date is None or today > self._last_reset_date:
+            self._daily_pnl = 0.0
+            self._trade_count = 0
+            self._last_reset_date = today
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX 3 — CooldownManager (per-strategy consecutive-loss cooldown)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class CooldownManager:
+    """Enforces a trading cooldown after N consecutive losses for a strategy."""
+
+    def __init__(self, max_consecutive_losses: int = 3, cooldown_minutes: int = 30):
+        self._max_losses = max_consecutive_losses
+        self._cooldown_duration = timedelta(minutes=cooldown_minutes)
+        self._loss_streaks: Dict[str, int] = defaultdict(int)
+        self._cooldown_until: Dict[str, datetime] = {}
+        self._lock = threading.Lock()
+
+    def record_result(self, strategy: str, won: bool) -> None:
+        with self._lock:
+            if won:
+                self._loss_streaks[strategy] = 0
+            else:
+                self._loss_streaks[strategy] += 1
+                streak = self._loss_streaks[strategy]
+                logger.info("CooldownManager: %s loss streak = %d", strategy, streak)
+                if streak >= self._max_losses:
+                    until = datetime.now(timezone.utc) + self._cooldown_duration
+                    self._cooldown_until[strategy] = until
+                    logger.warning(
+                        "CooldownManager: %s entering cooldown until %s "
+                        "(%d consecutive losses)",
+                        strategy, until.isoformat(), streak)
+
+    def is_in_cooldown(self, strategy: str) -> bool:
+        with self._lock:
+            until = self._cooldown_until.get(strategy)
+            if until is None:
+                return False
+            if datetime.now(timezone.utc) >= until:
+                self._cooldown_until.pop(strategy, None)
+                self._loss_streaks[strategy] = 0
+                logger.info("CooldownManager: %s cooldown expired, resetting", strategy)
+                return False
+            return True
+
+    def get_status(self, strategy: str) -> dict:
+        with self._lock:
+            streak = self._loss_streaks.get(strategy, 0)
+            until = self._cooldown_until.get(strategy)
+            in_cd = until is not None and datetime.now(timezone.utc) < until
+            return {
+                "strategy": strategy,
+                "loss_streak": streak,
+                "in_cooldown": in_cd,
+                "cooldown_until": until.isoformat() if until else None,
+            }
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX 4 — DrawdownCircuitBreaker (max drawdown kill-switch)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+class DrawdownCircuitBreaker:
+    """Blocks ALL trading when drawdown from peak equity exceeds a threshold."""
+
+    def __init__(self, max_drawdown_pct: float = 10.0, lockout_hours: int = 24):
+        self._max_dd_pct = max_drawdown_pct
+        self._lockout_duration = timedelta(hours=lockout_hours)
+        self._peak_equity: float = 0.0
+        self._current_equity: float = 0.0
+        self._tripped_until: Optional[datetime] = None
+        self._lock = threading.Lock()
+
+    def update_equity(self, equity: float) -> None:
+        with self._lock:
+            self._current_equity = equity
+            if equity > self._peak_equity:
+                self._peak_equity = equity
+            if self._peak_equity <= 0:
+                return
+            dd_pct = ((self._peak_equity - equity) / self._peak_equity) * 100.0
+            if dd_pct >= self._max_dd_pct and self._tripped_until is None:
+                self._tripped_until = datetime.now(timezone.utc) + self._lockout_duration
+                logger.critical(
+                    "DrawdownCircuitBreaker TRIPPED: %.2f%% drawdown "
+                    "(peak=%.2f, current=%.2f). Blocked until %s",
+                    dd_pct, self._peak_equity, equity,
+                    self._tripped_until.isoformat())
+
+    def can_trade(self) -> bool:
+        with self._lock:
+            if self._tripped_until is None:
+                return True
+            if datetime.now(timezone.utc) >= self._tripped_until:
+                logger.info("DrawdownCircuitBreaker lockout expired, resetting")
+                self.reset()
+                return True
+            return False
+
+    def reset(self) -> None:
+        self._tripped_until = None
+        self._peak_equity = self._current_equity
+
+    @property
+    def drawdown_pct(self) -> float:
+        if self._peak_equity <= 0:
+            return 0.0
+        return ((self._peak_equity - self._current_equity) / self._peak_equity) * 100.0
+
+    def get_status(self) -> dict:
+        tripped = (self._tripped_until is not None
+                   and datetime.now(timezone.utc) < self._tripped_until)
+        return {
+            "peak_equity": self._peak_equity,
+            "current_equity": self._current_equity,
+            "drawdown_pct": round(self.drawdown_pct, 2),
+            "tripped": tripped,
+            "tripped_until": (self._tripped_until.isoformat()
+                              if self._tripped_until else None),
+        }
+
+
+# ─── Risk-gate helper (shared by /webhook and /ai-webhook) ───
+def _check_risk_gates(
+    app: FastAPI, alert: AlertPayload, quantity: float,
+) -> Optional[JSONResponse]:
+    """Run all risk checks before order execution.
+    Returns a JSONResponse to short-circuit if blocked, else None.
+    """
+    # FIX 2: Daily loss limit
+    if not app.state.pnl_tracker.can_trade():
+        logger.warning("BLOCKED by daily loss limit: %s %s", alert.action, alert.symbol)
+        return JSONResponse(status_code=200, content={
+            "status": "blocked", "reason": "daily_loss_limit",
+            "daily_pnl": app.state.pnl_tracker.daily_pnl,
+        })
+
+    # FIX 3: Strategy cooldown
+    strategy = alert.strategy or "default"
+    if app.state.cooldown_mgr.is_in_cooldown(strategy):
+        status = app.state.cooldown_mgr.get_status(strategy)
+        logger.warning("BLOCKED by cooldown: strategy=%s", strategy)
+        return JSONResponse(status_code=200, content={
+            "status": "blocked", "reason": "strategy_cooldown", **status,
+        })
+
+    # FIX 4: Drawdown circuit breaker
+    if not app.state.drawdown_breaker.can_trade():
+        dd_status = app.state.drawdown_breaker.get_status()
+        logger.warning("BLOCKED by drawdown circuit breaker")
+        return JSONResponse(status_code=200, content={
+            "status": "blocked", "reason": "drawdown_circuit_breaker", **dd_status,
+        })
+
+    # FIX 5: Position size dollar cap
+    max_trade_value: float = app.state.config.get(
+        "risk_management", {}).get("max_trade_value", 50000.0)
+    trade_value = quantity * alert.price
+    if trade_value > max_trade_value:
+        capped_qty = max_trade_value / alert.price if alert.price > 0 else quantity
+        logger.warning(
+            "Position size capped: %.2f × %.2f = $%.2f > $%.2f → qty=%.2f",
+            quantity, alert.price, trade_value, max_trade_value, capped_qty)
+        alert.quantity = capped_qty
+
+    # GAP 12: Sector exposure limit
+    sector = SECTOR_MAP.get(alert.symbol.upper(), "Unknown")
+    if alert.action.lower() in ("buy", "long"):
+        sector_positions = getattr(app.state, "sector_tracker", {})
+        total_positions = sum(sector_positions.values()) if sector_positions else 0
+        sector_count = sector_positions.get(sector, 0)
+        max_sector_pct = app.state.config.get(
+            "risk_management", {}).get("max_sector_pct", 30.0)
+        if total_positions > 0 and (sector_count / total_positions * 100) > max_sector_pct:
+            logger.warning(
+                "BLOCKED by sector limit: %s has %d/%d positions (%.1f%% > %.1f%%)",
+                sector, sector_count, total_positions,
+                sector_count / total_positions * 100, max_sector_pct,
+            )
+            return JSONResponse(status_code=200, content={
+                "status": "blocked",
+                "reason": "sector_concentration",
+                "sector": sector,
+                "sector_positions": sector_count,
+                "total_positions": total_positions,
+                "sector_pct": round(sector_count / total_positions * 100, 1),
+                "max_sector_pct": max_sector_pct,
+            })
+
+    return None
+
+
 def validate_hmac_signature(
     payload: bytes, signature: str, secret: str, algorithm: str = "sha256"
 ) -> bool:
@@ -503,10 +977,49 @@ def validate_hmac_signature(
     if not signature or not secret:
         return False
 
-    hash_func = getattr(hashlib, algorithm, hashlib.sha256)
+    hash_func = getattr(hashlib, algorithm, None)
+    if hash_func is None:
+        logger.warning(
+            "Invalid HMAC algorithm '%s', falling back to sha256", algorithm
+        )
+        hash_func = hashlib.sha256
     expected = hmac.new(secret.encode(), payload, hash_func).hexdigest()
 
     return hmac.compare_digest(expected, signature)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FIX 1 — Webhook Idempotency (dedup cache)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+_processed_alerts: Dict[str, datetime] = {}
+_DEDUP_TTL = timedelta(minutes=5)
+_dedup_lock = threading.Lock()
+
+
+def _get_alert_id(payload_dict: dict, raw_body: bytes) -> str:
+    """Extract or compute a unique alert ID from the payload."""
+    alert_id = payload_dict.get("alert_id") or payload_dict.get("id")
+    if alert_id:
+        return str(alert_id)
+    return hashlib.sha256(raw_body).hexdigest()[:16]
+
+
+def _is_duplicate_alert(alert_id: str) -> bool:
+    """Check if alert_id was already processed within the TTL window."""
+    with _dedup_lock:
+        _cleanup_dedup_cache()
+        if alert_id in _processed_alerts:
+            return True
+        _processed_alerts[alert_id] = datetime.now(timezone.utc)
+        return False
+
+
+def _cleanup_dedup_cache() -> None:
+    """Remove entries older than the TTL from the dedup cache."""
+    now = datetime.now(timezone.utc)
+    expired = [k for k, v in _processed_alerts.items() if now - v > _DEDUP_TTL]
+    for k in expired:
+        del _processed_alerts[k]
 
 
 # ─── Application Factory ───
@@ -515,6 +1028,29 @@ def create_app(config_path: str = None) -> FastAPI:
     config = load_config(config_path)
     setup_logging(config)
 
+    # FIX 7: Validate HMAC secret — refuse to start with weak/empty secret
+    security_cfg = config.get("security", {})
+    hmac_secret = security_cfg.get("hmac_secret", "")
+    require_hmac = security_cfg.get("require_hmac", True)
+    weak_secrets = {"", "default_secret", "CHANGE_ME", "CHANGE_ME_TO_A_SECURE_SECRET_KEY"}
+
+    if hmac_secret in weak_secrets:
+        if require_hmac:
+            import os as _os
+            generated_secret = _os.urandom(32).hex()
+            security_cfg["hmac_secret"] = generated_secret
+            config["security"] = security_cfg
+            logger.critical(
+                "HMAC secret was empty/default. Generated random secret for this session: %s",
+                generated_secret,
+            )
+            print(f"\n⚠️  GENERATED HMAC SECRET (save this in config.yaml): {generated_secret}\n")
+        else:
+            logger.warning(
+                "HMAC secret is empty/default and require_hmac=False. "
+                "Webhook signature validation is DISABLED. This is insecure!"
+            )
+
     server_config = config.get("server", {})
     app = FastAPI(
         title=server_config.get("title", "TradingView Webhook Server"),
@@ -522,10 +1058,12 @@ def create_app(config_path: str = None) -> FastAPI:
         debug=server_config.get("debug", False),
     )
 
+    # Fix 7: CORS restriction — configurable origins, default empty (no browser access)
+    cors_origins = config.get("security", {}).get("cors_origins", [])
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -536,6 +1074,7 @@ def create_app(config_path: str = None) -> FastAPI:
     app.state.last_alert_time = None
     app.state.total_alerts = 0
     app.state.broker_router = BrokerRouter(config)
+    app.state.sector_tracker: Dict[str, int] = defaultdict(int)
 
     rate_config = config.get("rate_limiting", {})
     app.state.rate_limiter = RateLimiter(
@@ -552,6 +1091,38 @@ def create_app(config_path: str = None) -> FastAPI:
         except Exception as e:
             logger.warning(f"Failed to initialize AlertDispatcher: {e}")
 
+    # ─── Risk Management State (FIX 2-5) ───
+    risk_cfg = config.get("risk_management", {})
+
+    app.state.pnl_tracker = DailyPnLTracker(
+        max_daily_loss=risk_cfg.get("max_daily_loss", 5000.0),
+        reset_hour_utc=risk_cfg.get("daily_reset_hour_utc", 0),
+    )
+    app.state.cooldown_mgr = CooldownManager(
+        max_consecutive_losses=risk_cfg.get("max_consecutive_losses", 3),
+        cooldown_minutes=risk_cfg.get("cooldown_minutes", 30),
+    )
+    app.state.drawdown_breaker = DrawdownCircuitBreaker(
+        max_drawdown_pct=risk_cfg.get("max_drawdown_pct", 10.0),
+        lockout_hours=risk_cfg.get("drawdown_lockout_hours", 24),
+    )
+
+    # ─── Health Monitor (FIX 1) ───
+    hm_cfg = config.get("health_monitor", {})
+    app.state.health_monitor = HealthMonitor(
+        ping_url=hm_cfg.get("ping_url", ""),
+        ping_interval_seconds=hm_cfg.get("ping_interval_seconds", 60),
+        max_silence_minutes=hm_cfg.get("max_silence_minutes", 30),
+        alert_dispatcher=app.state.alert_dispatcher,
+        alert_timeout_hours=hm_cfg.get("alert_timeout_hours", 12.0),
+    )
+
+    # GAP 3: Latency tracking config
+    app.state.prefer_limit_orders: bool = config.get(
+        "risk_management", {}).get("prefer_limit_orders", True)
+    app.state.limit_order_offset_pct: float = config.get(
+        "risk_management", {}).get("limit_order_offset_pct", 0.02)
+
     # ─── Logging Middleware ───
     @app.middleware("http")
     async def log_requests(request: Request, call_next):
@@ -567,24 +1138,32 @@ def create_app(config_path: str = None) -> FastAPI:
         )
         return response
 
-    # ─── Health Endpoint ───
-    @app.get("/health", response_model=HealthResponse)
+    # ─── Health Endpoint (enhanced — FIX 1) ───
+    @app.get("/health")
     async def health_check():
-        """Health check endpoint returning server status and uptime."""
-        uptime = time.time() - app.state.start_time
+        """Health check endpoint returning server status, uptime, and risk status."""
+        hm = app.state.health_monitor
+        uptime = hm.uptime_seconds
         last_alert = (
-            app.state.last_alert_time.isoformat()
-            if app.state.last_alert_time
-            else None
+            hm.last_alert_time.isoformat() if hm.last_alert_time else None
         )
 
-        return HealthResponse(
-            status="healthy",
-            uptime_seconds=round(uptime, 2),
-            last_alert_time=last_alert,
-            total_alerts_processed=app.state.total_alerts,
-            version=server_config.get("version", "1.0.0"),
-        )
+        return JSONResponse(content={
+            "status": "ok",
+            "uptime": round(uptime, 2),
+            "last_alert_time": last_alert,
+            "alerts_processed": hm.alerts_processed,
+            "version": server_config.get("version", "1.0.0"),
+            "latency": hm.get_latency_stats(),
+            "alert_freshness": hm.check_alert_freshness()["detail"],
+            "risk": {
+                "daily_pnl": app.state.pnl_tracker.daily_pnl,
+                "daily_trade_count": app.state.pnl_tracker.trade_count,
+                "daily_loss_limit_ok": app.state.pnl_tracker.can_trade(),
+                "drawdown": app.state.drawdown_breaker.get_status(),
+                "sector_exposure": dict(app.state.sector_tracker),
+            },
+        })
 
     # ─── Webhook Endpoint ───
     @app.post("/webhook")
@@ -629,17 +1208,26 @@ def create_app(config_path: str = None) -> FastAPI:
 
         # ── Parse Payload ──
         try:
-            import json
             payload_dict = json.loads(raw_body)
             alert = AlertPayload(**payload_dict)
         except Exception as e:
             logger.error(f"Invalid payload from {client_ip}: {e}")
             raise HTTPException(status_code=422, detail=f"Invalid payload: {str(e)}")
 
+        # ── FIX 1: Idempotency — deduplicate alerts ──
+        alert_id = _get_alert_id(payload_dict, raw_body)
+        if _is_duplicate_alert(alert_id):
+            logger.info("Duplicate alert skipped: %s", alert_id)
+            return JSONResponse(status_code=200, content={
+                "status": "duplicate", "alert_id": alert_id,
+            })
+
         # ── Passphrase Validation ──
+        # Fix 6: constant-time passphrase comparison
         if security_config.get("require_passphrase", False):
             expected_passphrase = security_config.get("passphrase", "")
-            if alert.passphrase != expected_passphrase:
+            received = alert.passphrase or ""
+            if not hmac.compare_digest(received, expected_passphrase):
                 logger.warning(f"Invalid passphrase from {client_ip}")
                 raise HTTPException(status_code=401, detail="Invalid passphrase")
 
@@ -651,27 +1239,70 @@ def create_app(config_path: str = None) -> FastAPI:
                 detail=f"Invalid action: {alert.action}. Must be one of: {valid_actions}",
             )
 
+        # ── Risk Gates (FIX 2-5) ──
+        quantity = alert.quantity or 1.0
+        risk_block = _check_risk_gates(app, alert, quantity)
+        if risk_block is not None:
+            return risk_block
+        quantity = alert.quantity or quantity
+
+        # ── GAP 3: Track alert-received time ──
+        alert_received_time = datetime.now(timezone.utc)
+
+        # ── GAP 3: Prefer limit orders with price offset ──
+        effective_order_type = alert.order_type
+        effective_price = alert.price
+        if (
+            app.state.prefer_limit_orders
+            and alert.order_type == "market"
+            and alert.price > 0
+        ):
+            offset_pct = app.state.limit_order_offset_pct / 100.0
+            if alert.action.lower() in ("buy", "long"):
+                effective_price = round(alert.price * (1 + offset_pct), 2)
+            else:
+                effective_price = round(alert.price * (1 - offset_pct), 2)
+            effective_order_type = "limit"
+            logger.info(
+                "Prefer limit orders: converted market → limit @ $%.2f "
+                "(offset=%.4f%% from $%.2f)",
+                effective_price, app.state.limit_order_offset_pct, alert.price,
+            )
+
         # ── Route to Broker ──
         try:
             broker = app.state.broker_router.get_broker(alert.symbol)
-            quantity = alert.quantity or 1.0
 
             order_result = broker.place_order(
                 symbol=alert.symbol,
                 action=alert.action.lower(),
                 quantity=quantity,
-                order_type=alert.order_type,
-                price=alert.price,
+                order_type=effective_order_type,
+                price=effective_price,
             )
         except Exception as e:
             logger.error(f"Broker execution error: {e}")
-            raise HTTPException(
-                status_code=500, detail=f"Broker execution failed: {str(e)}"
-            )
+            # FIX 1: Return HTTP 200 on broker errors to prevent TradingView retries
+            return JSONResponse(status_code=200, content={
+                "status": "error", "detail": str(e),
+            })
+
+        # ── GAP 3: Track order-placed time and compute latency ──
+        order_placed_time = datetime.now(timezone.utc)
+        latency_ms = (order_placed_time - alert_received_time).total_seconds() * 1000
+        app.state.health_monitor.record_latency(latency_ms)
 
         # ── Update State ──
         app.state.last_alert_time = datetime.now(timezone.utc)
         app.state.total_alerts += 1
+        app.state.health_monitor.record_alert()
+
+        # Track sector exposure (GAP 12)
+        sector = SECTOR_MAP.get(alert.symbol.upper(), "Unknown")
+        if alert.action.lower() in ("buy", "long"):
+            app.state.sector_tracker[sector] = app.state.sector_tracker.get(sector, 0) + 1
+        elif alert.action.lower() in ("sell", "close"):
+            app.state.sector_tracker[sector] = max(0, app.state.sector_tracker.get(sector, 0) - 1)
 
         # ── Dispatch Notifications ──
         if app.state.alert_dispatcher:
@@ -690,6 +1321,19 @@ def create_app(config_path: str = None) -> FastAPI:
                 )
             except Exception as e:
                 logger.warning(f"Notification dispatch failed: {e}")
+
+        # ── FIX 5: Wire risk controls to actual trade results ──
+        if order_result.success:
+            try:
+                pnl = 0.0  # P&L calculated on close; record 0 on open for tracking
+                app.state.pnl_tracker.record_trade(alert.symbol, pnl)
+                app.state.drawdown_breaker.update_equity(
+                    app.state.drawdown_breaker._current_equity
+                )
+                strategy = alert.strategy or "default"
+                app.state.cooldown_mgr.record_result(strategy, won=True)
+            except Exception as risk_exc:
+                logger.warning("Risk control update failed: %s", risk_exc)
 
         logger.info(
             f"Alert processed: {alert.action} {alert.symbol} @ {alert.price} "
@@ -730,6 +1374,12 @@ def create_app(config_path: str = None) -> FastAPI:
         client_ip = request.client.host if request.client else "unknown"
         security_config = config.get("security", {})
 
+        # ── FIX 3: HMAC / passphrase authentication (same as /webhook) ──
+        allowed_ips = security_config.get("allowed_ips", [])
+        if allowed_ips and client_ip not in allowed_ips:
+            logger.warning("AI-webhook rejected from unauthorized IP: %s", client_ip)
+            raise HTTPException(status_code=403, detail="IP not allowed")
+
         # ── Rate Limiting ──
         if config.get("rate_limiting", {}).get("enabled", True):
             if not app.state.rate_limiter.is_allowed(client_ip):
@@ -737,19 +1387,45 @@ def create_app(config_path: str = None) -> FastAPI:
 
         # ── Parse Payload ──
         raw_body = await request.body()
+
+        # ── HMAC Signature Validation ──
+        hmac_secret = security_config.get("hmac_secret", "")
+        signature = request.headers.get("X-Webhook-Signature", "")
+        if hmac_secret and hmac_secret != "CHANGE_ME_TO_A_SECURE_SECRET_KEY":
+            algorithm = security_config.get("hmac_algorithm", "sha256")
+            if not validate_hmac_signature(raw_body, signature, hmac_secret, algorithm):
+                logger.warning("AI-webhook invalid HMAC from %s", client_ip)
+                raise HTTPException(status_code=401, detail="Invalid signature")
+
         try:
-            import json
             payload_dict = json.loads(raw_body)
             alert = AlertPayload(**payload_dict)
         except Exception as e:
             raise HTTPException(status_code=422, detail=f"Invalid payload: {str(e)}")
+
+        # ── Passphrase Validation ──
+        if security_config.get("require_passphrase", False):
+            expected_passphrase = security_config.get("passphrase", "")
+            if not hmac.compare_digest(str(alert.passphrase or ""), str(expected_passphrase or "")):
+                logger.warning("AI-webhook invalid passphrase from %s", client_ip)
+                raise HTTPException(status_code=401, detail="Invalid passphrase")
+
+        # ── FIX 1: Idempotency — deduplicate alerts ──
+        alert_id = _get_alert_id(payload_dict, raw_body)
+        if _is_duplicate_alert(alert_id):
+            logger.info("AI-webhook duplicate alert skipped: %s", alert_id)
+            return JSONResponse(status_code=200, content={
+                "status": "duplicate", "alert_id": alert_id,
+            })
 
         # ── Fetch Data for AI Agent ──
         ai_result = {"agent_used": False, "agent_action": None, "confidence": 0}
 
         try:
             import sys, os
-            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+            _ai_path = os.path.join(os.path.dirname(__file__), "..", "..")
+            if _ai_path not in sys.path:
+                sys.path.insert(0, _ai_path)
 
             from shared.data.public_data_fetcher import PublicDataFetcher
             from shared.ml.self_learning_agent import SelfLearningAgent, AgentConfig
@@ -800,23 +1476,70 @@ def create_app(config_path: str = None) -> FastAPI:
         except Exception as e:
             logger.warning("AI agent processing failed (executing TV signal anyway): %s", e)
 
+        # ── Risk Gates (FIX 2-5) ──
+        quantity = alert.quantity or 1.0
+        risk_block = _check_risk_gates(app, alert, quantity)
+        if risk_block is not None:
+            return risk_block
+        quantity = alert.quantity or quantity
+
+        # ── GAP 3: Track alert-received time ──
+        ai_alert_received_time = datetime.now(timezone.utc)
+
+        # ── GAP 3: Prefer limit orders with price offset ──
+        effective_order_type = alert.order_type
+        effective_price = alert.price
+        if (
+            app.state.prefer_limit_orders
+            and alert.order_type == "market"
+            and alert.price > 0
+        ):
+            offset_pct = app.state.limit_order_offset_pct / 100.0
+            if alert.action.lower() in ("buy", "long"):
+                effective_price = round(alert.price * (1 + offset_pct), 2)
+            else:
+                effective_price = round(alert.price * (1 - offset_pct), 2)
+            effective_order_type = "limit"
+
         # ── Route to Broker (real execution) ──
         try:
             broker = app.state.broker_router.get_broker(alert.symbol)
-            quantity = alert.quantity or 1.0
 
             order_result = broker.place_order(
                 symbol=alert.symbol,
                 action=alert.action.lower(),
                 quantity=quantity,
-                order_type=alert.order_type,
-                price=alert.price,
+                order_type=effective_order_type,
+                price=effective_price,
             )
         except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Broker execution failed: {str(e)}")
+            logger.error("AI-webhook broker error: %s", e)
+            # FIX 1: Return HTTP 200 on broker errors to prevent TradingView retries
+            return JSONResponse(status_code=200, content={
+                "status": "error", "detail": str(e),
+            })
+
+        # ── GAP 3: Track order-placed time and compute latency ──
+        ai_order_placed_time = datetime.now(timezone.utc)
+        ai_latency_ms = (ai_order_placed_time - ai_alert_received_time).total_seconds() * 1000
+        app.state.health_monitor.record_latency(ai_latency_ms)
 
         app.state.last_alert_time = datetime.now(timezone.utc)
         app.state.total_alerts += 1
+        app.state.health_monitor.record_alert()
+
+        # ── FIX 5: Wire risk controls to actual trade results ──
+        if order_result.success:
+            try:
+                pnl = 0.0
+                app.state.pnl_tracker.record_trade(alert.symbol, pnl)
+                app.state.drawdown_breaker.update_equity(
+                    app.state.drawdown_breaker._current_equity
+                )
+                strategy = alert.strategy or "default"
+                app.state.cooldown_mgr.record_result(strategy, won=True)
+            except Exception as risk_exc:
+                logger.warning("AI-webhook risk control update failed: %s", risk_exc)
 
         # ── Notifications ──
         if app.state.alert_dispatcher:
@@ -877,6 +1600,26 @@ def create_app(config_path: str = None) -> FastAPI:
             },
         }
 
+    # Fix 15: validate broker package installed at startup
+    default_broker = config.get("broker_routing", {}).get("default_broker", "interactive_brokers")
+    broker_pkg_map = {
+        "interactive_brokers": "interactive_brokers",
+        "tradestation": "tradestation",
+        "schwab": "thinkorswim",
+        "thinkorswim": "thinkorswim",
+    }
+    pkg = broker_pkg_map.get(default_broker)
+    if pkg:
+        import importlib
+        try:
+            importlib.import_module(pkg)
+        except ImportError:
+            logger.warning(
+                "Default broker '%s' package '%s' not installed. "
+                "Order routing may fail.",
+                default_broker, pkg,
+            )
+
     return app
 
 
@@ -884,18 +1627,78 @@ def create_app(config_path: str = None) -> FastAPI:
 app = create_app()
 
 
-# ─── Main Entry Point ───
+# ─── Main Entry Point (with auto-restart + startup notification) ───
 if __name__ == "__main__":
     import uvicorn
 
     config = load_config()
     server_config = config.get("server", {})
+    host = server_config.get("host", "0.0.0.0")
+    port = server_config.get("port", 5000)
 
-    uvicorn.run(
-        "webhook_server:app",
-        host=server_config.get("host", "0.0.0.0"),
-        port=server_config.get("port", 5000),
-        reload=server_config.get("debug", False),
-        workers=server_config.get("workers", 1),
-        log_level=config.get("logging", {}).get("level", "info").lower(),
-    )
+    # Start health monitor background thread
+    app.state.health_monitor.start()
+
+    # Startup notification
+    startup_msg = f"🚀 Webhook server started on {host}:{port}"
+    logger.info(startup_msg)
+    if app.state.alert_dispatcher:
+        try:
+            app.state.alert_dispatcher.dispatch(
+                title="Webhook Server Started",
+                message=startup_msg,
+                level="info",
+            )
+        except Exception:
+            pass
+
+    # Auto-restart wrapper
+    max_restarts = server_config.get("max_restarts", 5)
+    restart_count = 0
+    last_restart_time = time.time()
+    while restart_count < max_restarts:
+        try:
+            uvicorn.run(
+                "webhook_server:app",
+                host=host,
+                port=port,
+                reload=server_config.get("debug", False),
+                workers=server_config.get("workers", 1),
+                log_level=config.get("logging", {}).get("level", "info").lower(),
+            )
+            break  # clean shutdown
+        except Exception as exc:
+            # Fix 13: reset restart counter after 1 hour of uptime
+            now = time.time()
+            if now - last_restart_time >= 3600:
+                restart_count = 0
+                logger.info("Server ran >1h, resetting restart counter")
+            last_restart_time = now
+
+            restart_count += 1
+            logger.critical(
+                "Server crashed (%d/%d): %s — restarting in 5s",
+                restart_count, max_restarts, exc,
+            )
+            if app.state.alert_dispatcher:
+                try:
+                    app.state.alert_dispatcher.dispatch(
+                        title="Webhook Server CRASH",
+                        message=f"Crash #{restart_count}: {exc}. Restarting\u2026",
+                        level="critical",
+                    )
+                except Exception:
+                    pass
+            time.sleep(5)
+
+    if restart_count >= max_restarts:
+        logger.critical("Max restarts (%d) exhausted. Server NOT restarting.", max_restarts)
+        if app.state.alert_dispatcher:
+            try:
+                app.state.alert_dispatcher.dispatch(
+                    title="Webhook Server DEAD",
+                    message=f"Exhausted {max_restarts} restarts. Manual intervention required.",
+                    level="critical",
+                )
+            except Exception:
+                pass

@@ -14,7 +14,11 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any
 
-import requests
+try:
+    import requests
+    _HAS_REQUESTS = True
+except ImportError:
+    _HAS_REQUESTS = False
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +82,9 @@ class AlertDispatcher:
 
     def _send_discord(self, title: str, message: str, priority: str) -> None:
         """POST an embed to the configured Discord webhook URL."""
+        if not _HAS_REQUESTS:
+            logger.warning("requests library not installed; skipping Discord.")
+            return
         discord_cfg = self.config.get("discord", {})
         webhook_url = discord_cfg.get("webhook_url", "")
         if not webhook_url:
@@ -134,6 +141,9 @@ class AlertDispatcher:
 
     def _send_sms(self, title: str, message: str, priority: str) -> None:
         """Send an SMS via the Twilio REST API."""
+        if not _HAS_REQUESTS:
+            logger.warning("requests library not installed; skipping SMS.")
+            return
         sms_cfg = self.config.get("sms", {})
         account_sid = sms_cfg.get("account_sid", "")
         auth_token = sms_cfg.get("auth_token", "")

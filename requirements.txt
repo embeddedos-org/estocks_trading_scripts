@@ -4,7 +4,7 @@ httpx
 pyyaml
 python-dotenv
 pandas
-numpy
+numpy>=1.24,<2.0
 requests
 pytest
 pytest-asyncio
@@ -18,7 +18,7 @@ joblib>=1.3
 optuna>=3.0
 
 # Optional: Extended technical indicators (130+ indicators)
-pandas-ta>=0.3.14b
+pandas-ta>=0.3.14b1
 
 # Optional: Charting/Visualization
 matplotlib>=3.7
@@ -27,7 +27,7 @@ seaborn>=0.12
 
 # Optional: Reinforcement Learning
 gymnasium>=0.29
-stable-baselines3>=2.0
+stable-baselines3>=2.0  # NOTE: requires torch>=2.0; pin torch<2.5 if SB3<2.4
 
 # Optional: Statistical analysis
 statsmodels>=0.14

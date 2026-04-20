@@ -13,13 +13,16 @@ class TestIBConnectionFactory:
 
     def test_create_returns_connection_object(self):
         from interactive_brokers.utils.ib_connection import IBConnection
-        conn = IBConnection.create(
-            backend="ib_async",
-            host="127.0.0.1",
-            port=7497,
-            client_id=99,
-        )
-        assert conn is not None
+        try:
+            conn = IBConnection.create(
+                backend="ib_async",
+                host="127.0.0.1",
+                port=7497,
+                client_id=99,
+            )
+            assert conn is not None
+        except ImportError:
+            pytest.skip("ib_async not installed")
 
     def test_create_ib_async_backend(self):
         from interactive_brokers.utils.ib_connection import IBConnection
@@ -77,9 +80,14 @@ class TestIBConnectionInterface:
 
     def test_not_connected_initially(self):
         from interactive_brokers.utils.ib_connection import IBConnection
+        from unittest.mock import patch, MagicMock
         try:
-            conn = IBConnection.create(port=7497)
-            assert conn.is_connected() is False
+            mock_ib = MagicMock()
+            mock_ib.isConnected.return_value = False
+            with patch("interactive_brokers.utils.ib_connection.IBAsyncConnection._import_ib_async") as mock_import:
+                conn = IBConnection.create(port=7497)
+                conn._ib = mock_ib
+                assert conn.is_connected() is False
         except ImportError:
             pytest.skip("ib_async not installed")
 
@@ -93,22 +101,24 @@ class TestIBConnectionContextManager:
         assert hasattr(conn, "__enter__")
         assert hasattr(conn, "__exit__")
 
+    @patch("interactive_brokers.utils.ib_connection.IBAsyncConnection._import_ib_async")
     @patch("interactive_brokers.utils.ib_connection.IBAsyncConnection.connect")
     @patch("interactive_brokers.utils.ib_connection.IBAsyncConnection.disconnect")
-    def test_context_manager_calls_connect_disconnect(self, mock_disconnect, mock_connect):
+    async def test_context_manager_calls_connect_disconnect(self, mock_disconnect, mock_connect, mock_import):
         from interactive_brokers.utils.ib_connection import IBConnection
         conn = IBConnection.create(backend="ib_async", port=7497)
-        with conn:
+        async with conn:
             mock_connect.assert_called_once()
         mock_disconnect.assert_called_once()
 
+    @patch("interactive_brokers.utils.ib_connection.IBAsyncConnection._import_ib_async")
     @patch("interactive_brokers.utils.ib_connection.IBAsyncConnection.connect")
     @patch("interactive_brokers.utils.ib_connection.IBAsyncConnection.disconnect")
-    def test_context_manager_disconnects_on_exception(self, mock_disconnect, mock_connect):
+    async def test_context_manager_disconnects_on_exception(self, mock_disconnect, mock_connect, mock_import):
         from interactive_brokers.utils.ib_connection import IBConnection
         conn = IBConnection.create(backend="ib_async", port=7497)
         try:
-            with conn:
+            async with conn:
                 raise RuntimeError("test error")
         except RuntimeError:
             pass
