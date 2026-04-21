@@ -180,10 +180,37 @@ class PortfolioConstructionGenerator:
 
     @staticmethod
     def generate(method: str = "equal") -> str:
-        if method == "equal":
-            weight_logic = "var weight = 1.0m / activeInsights.Count;"
+        if method == "momentum":
+            # Weight proportional to each insight's magnitude (confidence score).
+            pre_loop = (
+                "var totalMag = activeInsights\n"
+                "                .Sum(i => i.Magnitude.HasValue ? (double)i.Magnitude.Value : 1.0);\n"
+                "            if (totalMag <= 0) totalMag = activeInsights.Count;"
+            )
+            weight_expr = (
+                "i.Magnitude.HasValue && totalMag > 0\n"
+                "                    ? (double)i.Magnitude.Value / totalMag\n"
+                "                    : 1.0 / activeInsights.Count"
+            )
+        elif method == "risk_parity":
+            # Equal-risk contribution: weight inversely proportional to
+            # insight magnitude used as a volatility proxy.
+            pre_loop = (
+                "var invMags = activeInsights\n"
+                "                .Select(i => i.Magnitude.HasValue && i.Magnitude.Value > 0\n"
+                "                    ? 1.0 / (double)i.Magnitude.Value : 1.0).ToList();\n"
+                "            var invTotal = invMags.Sum();\n"
+                "            if (invTotal <= 0) invTotal = activeInsights.Count;"
+            )
+            weight_expr = (
+                "invTotal > 0\n"
+                "                    ? invMags[activeInsights.IndexOf(i)] / invTotal\n"
+                "                    : 1.0 / activeInsights.Count"
+            )
         else:
-            weight_logic = "var weight = 1.0m / activeInsights.Count; // TODO: implement " + method
+            # Equal weight (default, covers "equal" and unknown values)
+            pre_loop = ""
+            weight_expr = "1.0 / activeInsights.Count"
 
         return f"""using QuantConnect.Algorithm.Framework.Portfolio;
 using QuantConnect.Algorithm.Framework.Alphas;
@@ -202,11 +229,11 @@ namespace QuantConnect.Algorithm.CSharp
             var result = new Dictionary<Insight, double>();
             if (activeInsights.Count == 0) return result;
 
-            {weight_logic}
-            foreach (var insight in activeInsights)
+            {pre_loop}
+            foreach (var i in activeInsights)
             {{
-                result[insight] = insight.Direction == InsightDirection.Up
-                    ? (double)weight : -(double)weight;
+                var w = {weight_expr};
+                result[i] = i.Direction == InsightDirection.Up ? w : -w;
             }}
             return result;
         }}
