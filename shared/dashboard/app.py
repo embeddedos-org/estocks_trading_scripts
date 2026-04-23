@@ -4,17 +4,19 @@ Graph Memory Dashboard -- FastAPI Backend
 ==========================================
 
 Serves an interactive web dashboard for visualising the GraphMemory graph.
-Includes WebSocket support for real-time graph updates.
+Includes WebSocket support for real-time graph updates and performance monitoring.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import json
 import os
 import sys
 import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -52,6 +54,85 @@ EDGE_STYLE = {
 }
 
 
+# ─── Performance Monitor ───
+
+
+class PerformanceMonitor:
+    """Tracks API latency, WebSocket throughput, and uptime metrics."""
+
+    def __init__(self, max_samples: int = 500) -> None:
+        self._lock = threading.Lock()
+        self._start_time = time.time()
+        self._max_samples = max_samples
+        self._api_latencies: Dict[str, collections.deque] = {}
+        self._ws_messages_sent = 0
+        self._ws_messages_failed = 0
+        self._ws_broadcast_latencies: collections.deque = collections.deque(maxlen=max_samples)
+        self._total_requests = 0
+        self._errors = 0
+
+    def record_api_latency(self, endpoint: str, latency_ms: float) -> None:
+        with self._lock:
+            self._total_requests += 1
+            if endpoint not in self._api_latencies:
+                self._api_latencies[endpoint] = collections.deque(maxlen=self._max_samples)
+            self._api_latencies[endpoint].append(latency_ms)
+
+    def record_api_error(self) -> None:
+        with self._lock:
+            self._errors += 1
+
+    def record_ws_broadcast(self, latency_ms: float, sent: int, failed: int) -> None:
+        with self._lock:
+            self._ws_messages_sent += sent
+            self._ws_messages_failed += failed
+            self._ws_broadcast_latencies.append(latency_ms)
+
+    def get_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            uptime = time.time() - self._start_time
+
+            api_stats: Dict[str, Any] = {}
+            for endpoint, latencies in self._api_latencies.items():
+                if not latencies:
+                    continue
+                sorted_lat = sorted(latencies)
+                n = len(sorted_lat)
+                api_stats[endpoint] = {
+                    "count": n,
+                    "avg_ms": round(sum(sorted_lat) / n, 2),
+                    "p50_ms": round(sorted_lat[n // 2], 2),
+                    "p95_ms": round(sorted_lat[int(n * 0.95)], 2) if n >= 2 else round(sorted_lat[-1], 2),
+                    "p99_ms": round(sorted_lat[int(n * 0.99)], 2) if n >= 2 else round(sorted_lat[-1], 2),
+                    "min_ms": round(sorted_lat[0], 2),
+                    "max_ms": round(sorted_lat[-1], 2),
+                }
+
+            ws_lat = sorted(self._ws_broadcast_latencies) if self._ws_broadcast_latencies else []
+            ws_n = len(ws_lat)
+
+            return {
+                "uptime_seconds": round(uptime, 1),
+                "total_requests": self._total_requests,
+                "total_errors": self._errors,
+                "error_rate": round(self._errors / max(self._total_requests, 1), 4),
+                "api_latency": api_stats,
+                "websocket": {
+                    "messages_sent": self._ws_messages_sent,
+                    "messages_failed": self._ws_messages_failed,
+                    "broadcasts": ws_n,
+                    "avg_broadcast_ms": round(sum(ws_lat) / ws_n, 2) if ws_n else 0,
+                    "p50_broadcast_ms": round(ws_lat[ws_n // 2], 2) if ws_n else 0,
+                    "p95_broadcast_ms": round(ws_lat[int(ws_n * 0.95)], 2) if ws_n >= 2 else (round(ws_lat[-1], 2) if ws_lat else 0),
+                    "throughput_per_sec": round(self._ws_messages_sent / max(uptime, 1), 2),
+                },
+                "active_ws_connections": manager.active_count,
+            }
+
+
+perf = PerformanceMonitor()
+
+
 # ─── WebSocket Connection Manager ───
 
 
@@ -70,14 +151,19 @@ class ConnectionManager:
             self._connections.remove(websocket)
 
     async def broadcast(self, message: dict) -> None:
+        start = time.perf_counter()
         stale: List[WebSocket] = []
+        sent = 0
         for ws in self._connections:
             try:
                 await ws.send_json(message)
+                sent += 1
             except Exception:
                 stale.append(ws)
         for ws in stale:
             self.disconnect(ws)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        perf.record_ws_broadcast(elapsed_ms, sent, len(stale))
 
     @property
     def active_count(self) -> int:
@@ -89,12 +175,7 @@ _event_loop: asyncio.AbstractEventLoop | None = None
 
 
 def _on_graph_change(event_type: str, data: Dict[str, Any]) -> None:
-    """Bridge sync GraphMemory callback → async WebSocket broadcast.
-
-    ``record_trade()`` runs in a sync thread, so we use
-    ``asyncio.run_coroutine_threadsafe()`` to schedule the broadcast
-    on the running event loop.
-    """
+    """Bridge sync GraphMemory callback -> async WebSocket broadcast."""
     if _event_loop is None or _event_loop.is_closed():
         return
     message = {"type": "graph_update", "event": event_type, "data": data}
@@ -168,6 +249,7 @@ async def index():
 @app.get("/api/graph")
 async def get_graph() -> Dict[str, Any]:
     """Return vis.js-compatible nodes + edges."""
+    start = time.perf_counter()
     gm = _gm_or_error()
     g = gm._graph
 
@@ -225,22 +307,26 @@ async def get_graph() -> Dict[str, Any]:
             "raw": {k: v_ for k, v_ in data.items()},
         })
 
+    perf.record_api_latency("/api/graph", (time.perf_counter() - start) * 1000)
     return {"nodes": nodes, "edges": edges}
 
 
 @app.get("/api/stats")
 async def get_stats() -> Dict[str, Any]:
+    start = time.perf_counter()
     gm = _gm_or_error()
     stats = gm.get_stats()
     g = gm._graph
     n = g.number_of_nodes()
     stats["density"] = round(g.number_of_edges() / (n * (n - 1)), 6) if n > 1 else 0
+    perf.record_api_latency("/api/stats", (time.perf_counter() - start) * 1000)
     return stats
 
 
 @app.get("/api/transitions")
 async def get_transitions() -> Dict[str, Any]:
     """Transition probabilities for all regime nodes."""
+    start = time.perf_counter()
     gm = _gm_or_error()
     g = gm._graph
     regimes = [
@@ -253,12 +339,14 @@ async def get_transitions() -> Dict[str, Any]:
         probs = gm.get_regime_transition_probs(regime)
         if probs:
             result[regime] = probs
+    perf.record_api_latency("/api/transitions", (time.perf_counter() - start) * 1000)
     return {"transitions": result}
 
 
 @app.get("/api/strategies")
 async def get_strategies() -> Dict[str, Any]:
     """Best strategy per regime."""
+    start = time.perf_counter()
     gm = _gm_or_error()
     g = gm._graph
     regimes = [
@@ -271,19 +359,32 @@ async def get_strategies() -> Dict[str, Any]:
         best = gm.get_best_strategy_for_regime(regime)
         if best:
             result[regime] = best
+    perf.record_api_latency("/api/strategies", (time.perf_counter() - start) * 1000)
     return {"strategies": result}
 
 
 @app.get("/api/correlations/{symbol}")
 async def get_correlations(symbol: str) -> Dict[str, Any]:
+    start = time.perf_counter()
     gm = _gm_or_error()
-    return {"symbol": symbol, "correlations": gm.get_correlated_symbols(symbol)}
+    result = {"symbol": symbol, "correlations": gm.get_correlated_symbols(symbol)}
+    perf.record_api_latency("/api/correlations", (time.perf_counter() - start) * 1000)
+    return result
 
 
 @app.get("/api/insight/{regime}/{symbol}")
 async def get_insight(regime: str, symbol: str) -> Dict[str, Any]:
+    start = time.perf_counter()
     gm = _gm_or_error()
-    return gm.get_graph_enhanced_insight(regime, symbol)
+    result = gm.get_graph_enhanced_insight(regime, symbol)
+    perf.record_api_latency("/api/insight", (time.perf_counter() - start) * 1000)
+    return result
+
+
+@app.get("/api/perf")
+async def get_perf() -> Dict[str, Any]:
+    """Return performance monitoring snapshot."""
+    return perf.get_snapshot()
 
 
 # ─── WebSocket Endpoint ───

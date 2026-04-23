@@ -70,6 +70,22 @@ table.transition-table th{color:#8b949e;font-weight:500}
 @keyframes slideIn{from{opacity:0;transform:translateX(100px)}to{opacity:1;transform:translateX(0)}}
 .toast-title{font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px;color:#8b949e}
 .toast-body{color:#c9d1d9}
+
+/* Performance monitor panel */
+.perf-table{width:100%;border-collapse:collapse;font-size:11px;margin-top:4px}
+.perf-table th,.perf-table td{padding:3px 4px;text-align:right;border-bottom:1px solid #21262d}
+.perf-table th{color:#8b949e;font-weight:500;text-align:left}
+.perf-table td:first-child{text-align:left;color:#58a6ff}
+.perf-val-good{color:#2ea043}
+.perf-val-warn{color:#e67e22}
+.perf-val-bad{color:#da3633}
+.perf-bar{display:inline-block;height:6px;border-radius:3px;vertical-align:middle;margin-right:4px}
+.ws-throughput{font-size:18px;font-weight:700;color:#58a6ff;text-align:center;padding:4px 0}
+.ws-throughput small{font-size:11px;color:#8b949e;font-weight:400}
+.perf-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px}
+.perf-metric{background:#21262d;border-radius:6px;padding:6px 8px;text-align:center}
+.perf-metric .val{font-size:16px;font-weight:700;color:#c9d1d9}
+.perf-metric .label{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px}
 </style>
 </head>
 <body>
@@ -89,6 +105,10 @@ table.transition-table th{color:#8b949e;font-weight:500}
 </div>
 <div class="main">
     <div class="sidebar">
+        <div class="panel">
+            <div class="panel-header">&#x26A1; Performance</div>
+            <div class="panel-body" id="perf-panel">Loading...</div>
+        </div>
         <div class="panel">
             <div class="panel-header">&#x1F4CA; Graph Stats</div>
             <div class="panel-body" id="stats-panel">Loading...</div>
@@ -132,6 +152,35 @@ const TYPE_COLORS = {
     trade: '#2ecc71', feature_state: '#95a5a6'
 };
 
+// ─── Client-side perf tracking ───
+var clientPerf = {
+    wsMessagesReceived: 0,
+    wsLastMessageTime: 0,
+    wsLatencies: [],
+    apiCallCount: 0,
+    apiLatencies: [],
+    maxSamples: 200,
+    startTime: Date.now()
+};
+
+function recordClientApiLatency(ms) {
+    clientPerf.apiCallCount++;
+    clientPerf.apiLatencies.push(ms);
+    if (clientPerf.apiLatencies.length > clientPerf.maxSamples)
+        clientPerf.apiLatencies.shift();
+}
+
+function recordClientWsMessage() {
+    var now = Date.now();
+    clientPerf.wsMessagesReceived++;
+    if (clientPerf.wsLastMessageTime > 0) {
+        clientPerf.wsLatencies.push(now - clientPerf.wsLastMessageTime);
+        if (clientPerf.wsLatencies.length > clientPerf.maxSamples)
+            clientPerf.wsLatencies.shift();
+    }
+    clientPerf.wsLastMessageTime = now;
+}
+
 function initFilters() {
     const container = document.getElementById('filters');
     container.innerHTML = NODE_TYPES.map(t => {
@@ -152,9 +201,12 @@ function applyFilters() {
 }
 
 async function fetchJSON(url) {
+    var start = performance.now();
     const res = await fetch(url);
     if (!res.ok) throw new Error(res.statusText);
-    return res.json();
+    var data = await res.json();
+    recordClientApiLatency(performance.now() - start);
+    return data;
 }
 
 async function loadGraph() {
@@ -322,9 +374,98 @@ async function loadStrategies() {
     panel.innerHTML = html;
 }
 
+// ─── Performance Panel ───
+
+async function loadPerf() {
+    try {
+        var data = await fetchJSON('/api/perf');
+        renderPerfPanel(data);
+    } catch (e) {
+        document.getElementById('perf-panel').innerHTML = '<em style="color:#8b949e">Unavailable</em>';
+    }
+}
+
+function renderPerfPanel(server) {
+    var panel = document.getElementById('perf-panel');
+    var uptime = formatUptime(server.uptime_seconds);
+    var wstp = server.websocket.throughput_per_sec;
+
+    var html = '';
+
+    // Top metrics grid
+    html += '<div class="perf-grid">';
+    html += '<div class="perf-metric"><div class="val">' + uptime + '</div><div class="label">Uptime</div></div>';
+    html += '<div class="perf-metric"><div class="val">' + server.active_ws_connections + '</div><div class="label">WS Clients</div></div>';
+    html += '<div class="perf-metric"><div class="val">' + server.total_requests + '</div><div class="label">API Calls</div></div>';
+    html += '<div class="perf-metric"><div class="val ' + latencyColor(wstp > 0 ? 1 : 0) + '">' + wstp.toFixed(1) + '</div><div class="label">WS msg/s</div></div>';
+    html += '</div>';
+
+    // WS throughput
+    html += '<div style="margin-top:8px">';
+    html += '<div class="stat-row"><span class="stat-label">WS Sent</span><span class="stat-value">' + server.websocket.messages_sent + '</span></div>';
+    html += '<div class="stat-row"><span class="stat-label">WS Failed</span><span class="stat-value ' + (server.websocket.messages_failed > 0 ? 'perf-val-bad' : '') + '">' + server.websocket.messages_failed + '</span></div>';
+    html += '<div class="stat-row"><span class="stat-label">WS Broadcast Avg</span><span class="stat-value">' + server.websocket.avg_broadcast_ms + 'ms</span></div>';
+    html += '<div class="stat-row"><span class="stat-label">WS Broadcast P95</span><span class="stat-value">' + server.websocket.p95_broadcast_ms + 'ms</span></div>';
+    html += '</div>';
+
+    // Client-side WS stats
+    html += '<div style="margin-top:6px;font-size:11px;color:#8b949e">Client-side:</div>';
+    html += '<div class="stat-row"><span class="stat-label">WS Received</span><span class="stat-value">' + clientPerf.wsMessagesReceived + '</span></div>';
+
+    // API latency table
+    var endpoints = Object.keys(server.api_latency);
+    if (endpoints.length > 0) {
+        html += '<div style="margin-top:8px;font-size:11px;color:#8b949e">API Latency (server):</div>';
+        html += '<table class="perf-table"><tr><th>Endpoint</th><th>Avg</th><th>P50</th><th>P95</th><th>Calls</th></tr>';
+        endpoints.forEach(function(ep) {
+            var s = server.api_latency[ep];
+            html += '<tr>';
+            html += '<td>' + ep.replace('/api/', '') + '</td>';
+            html += '<td class="' + latencyColor(s.avg_ms) + '">' + s.avg_ms + '</td>';
+            html += '<td>' + s.p50_ms + '</td>';
+            html += '<td class="' + latencyColor(s.p95_ms) + '">' + s.p95_ms + '</td>';
+            html += '<td>' + s.count + '</td>';
+            html += '</tr>';
+        });
+        html += '</table>';
+    }
+
+    // Client-side API latency
+    if (clientPerf.apiLatencies.length > 0) {
+        var sorted = clientPerf.apiLatencies.slice().sort(function(a,b){return a-b;});
+        var n = sorted.length;
+        var avg = sorted.reduce(function(a,b){return a+b;}, 0) / n;
+        html += '<div style="margin-top:6px;font-size:11px;color:#8b949e">API Latency (client RTT):</div>';
+        html += '<div class="stat-row"><span class="stat-label">Avg</span><span class="stat-value">' + avg.toFixed(1) + 'ms</span></div>';
+        html += '<div class="stat-row"><span class="stat-label">P95</span><span class="stat-value">' + sorted[Math.floor(n*0.95)].toFixed(1) + 'ms</span></div>';
+    }
+
+    // Error rate
+    if (server.total_requests > 0) {
+        var errPct = (server.error_rate * 100).toFixed(2);
+        html += '<div style="margin-top:6px" class="stat-row"><span class="stat-label">Error Rate</span><span class="stat-value ' + (server.error_rate > 0.01 ? 'perf-val-bad' : 'perf-val-good') + '">' + errPct + '%</span></div>';
+    }
+
+    panel.innerHTML = html;
+}
+
+function latencyColor(ms) {
+    if (ms <= 10) return 'perf-val-good';
+    if (ms <= 50) return '';
+    if (ms <= 200) return 'perf-val-warn';
+    return 'perf-val-bad';
+}
+
+function formatUptime(secs) {
+    if (secs < 60) return Math.floor(secs) + 's';
+    if (secs < 3600) return Math.floor(secs / 60) + 'm';
+    if (secs < 86400) return Math.floor(secs / 3600) + 'h ' + Math.floor((secs % 3600) / 60) + 'm';
+    return Math.floor(secs / 86400) + 'd ' + Math.floor((secs % 86400) / 3600) + 'h';
+}
+
 async function loadAll() {
     try {
-        await Promise.all([loadGraph(), loadStats(), loadTransitions(), loadStrategies()]);
+        await Promise.all([loadGraph(), loadStats(), loadTransitions(), loadStrategies(), loadPerf()]);
     } catch (e) {
         console.error('Dashboard load error:', e);
     }
@@ -357,6 +498,7 @@ function connectWebSocket() {
 
     ws.onmessage = function(evt) {
         try {
+            recordClientWsMessage();
             const msg = JSON.parse(evt.data);
             if (msg.type === 'graph_update') {
                 handleGraphUpdate(msg.event, msg.data);
@@ -412,7 +554,6 @@ function handleTradeRecorded(data) {
     showToast('Trade Recorded',
         'T' + data.trade_id + ' — ' + data.symbol + ' ' + data.action + ' ' + pnlStr, cls);
 
-    // Incremental update: add the new trade node + edges to the vis.js DataSet
     if (!nodesDataset || !edgesDataset) {
         loadAll();
         return;
@@ -428,7 +569,6 @@ function handleTradeRecorded(data) {
         'is_winner: ' + data.is_winner
     ];
 
-    // Add trade node
     nodesDataset.add({
         id: tradeNodeId,
         label: 'T' + data.trade_id,
@@ -441,7 +581,6 @@ function handleTradeRecorded(data) {
     });
     allNodes.push({id: tradeNodeId, label: 'T' + data.trade_id, group: 'trade', raw: data});
 
-    // Add edges to regime, symbol, and strategy nodes
     var regimeNodeId = 'regime:' + data.regime;
     var symbolNodeId = 'symbol:' + data.symbol;
 
@@ -474,9 +613,9 @@ function handleTradeRecorded(data) {
         edgesDataset.add(newEdges);
     }
 
-    // Refresh sidebar stats
     loadStats();
     loadStrategies();
+    loadPerf();
 }
 
 // ─── Toast Notification System ───
@@ -487,7 +626,6 @@ var MAX_TOASTS = 3;
 function showToast(title, body, cls) {
     var container = document.getElementById('toast-container');
 
-    // Evict oldest if at max
     while (toastQueue.length >= MAX_TOASTS) {
         var oldest = toastQueue.shift();
         if (oldest && oldest.el && oldest.el.parentNode) {
@@ -514,6 +652,12 @@ function showToast(title, body, cls) {
 
     toastQueue.push(entry);
 }
+
+// ─── Periodic perf refresh ───
+
+setInterval(function() {
+    loadPerf();
+}, 5000);
 
 // ─── Init ───
 
