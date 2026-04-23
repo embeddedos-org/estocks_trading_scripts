@@ -84,6 +84,11 @@ class AgentConfig:
     confidence_history_window: int = 50
     adaptive_thresholds: bool = True
 
+    # Graph memory
+    graph_memory_path: str = "graph_memory.json"
+    use_graph_memory: bool = True
+    graph_save_interval: int = 10
+
 
 class SelfLearningAgent:
     """Autonomous self-learning investment agent.
@@ -129,6 +134,18 @@ class SelfLearningAgent:
         self._training_data: Optional[pd.DataFrame] = None  # cached for auto-retrain
         self._data_fetcher = None  # GAP #1: set via set_data_fetcher() for fresh retrain data
         self._symbols: List[str] = []  # symbols being monitored
+
+        # Graph memory (optional NetworkX layer)
+        self._graph_memory = None
+        if self.config.use_graph_memory:
+            try:
+                from shared.ml.graph_memory import GraphMemory
+                self._graph_memory = GraphMemory(
+                    path=self.config.graph_memory_path,
+                    save_interval=self.config.graph_save_interval,
+                )
+            except ImportError:
+                logger.warning("networkx not available — graph memory disabled")
 
         logger.info("SelfLearningAgent initialized (memory: %s)", self._memory)
 
@@ -302,6 +319,25 @@ class SelfLearningAgent:
             elif signal.direction == -1:
                 action = "SELL"
 
+        # Graph memory insight
+        graph_insight: Optional[Dict[str, Any]] = None
+        if self._graph_memory is not None:
+            try:
+                # Try to get features for graph query
+                _graph_features: Dict[str, float] = {}
+                try:
+                    from shared.ml.regime_classifier import MLRegimeClassifier
+                    feat = MLRegimeClassifier.compute_features(df)
+                    top_feat = feat.iloc[-1].dropna().to_dict()
+                    _graph_features = {k: float(v) for k, v in list(top_feat.items())[:10]}
+                except Exception:
+                    pass
+                graph_insight = self._graph_memory.get_graph_enhanced_insight(
+                    regime, symbol, _graph_features,
+                )
+            except Exception as e:
+                logger.debug("Graph memory query failed: %s", e)
+
         # Memory-informed adjustment
         if memory_insight.get("sufficient_data") and memory_insight.get("recommendation") == "caution":
             if signal.confidence < 0.6:
@@ -346,6 +382,13 @@ class SelfLearningAgent:
             "portfolio_value_at_entry": self._risk_manager._current_equity,
         }
 
+        # Graph-informed confidence adjustment
+        if graph_insight and graph_insight.get("sufficient_data"):
+            best_strat = graph_insight.get("best_strategy")
+            if best_strat and best_strat.get("win_rate", 0) < 0.4 and signal.confidence < 0.6:
+                action = "HOLD"
+                logger.info("Graph override: strategy win_rate=%.2f in %s, holding", best_strat["win_rate"], regime)
+
         decision = {
             "action": action,
             "confidence": signal.confidence,
@@ -360,6 +403,7 @@ class SelfLearningAgent:
             },
             "risk_status": self._risk_manager.get_status(),
             "memory_insight": memory_insight,
+            "graph_insight": graph_insight,
             "reasoning": reasoning,
             "price": current_price,
         }
@@ -426,6 +470,25 @@ class SelfLearningAgent:
         )
 
         self._memory.record_trade(trade)
+
+        # Record to graph memory
+        if self._graph_memory is not None:
+            try:
+                graph_trade = {
+                    "regime": trade.regime,
+                    "symbol": trade.symbol,
+                    "action": trade.action,
+                    "pnl": trade.pnl,
+                    "pnl_pct": trade.pnl_pct,
+                    "is_winner": trade.is_winner,
+                    "ensemble_confidence": trade.ensemble_confidence,
+                    "decision_source": trade.decision_source,
+                    "features_snapshot": trade.features_snapshot,
+                }
+                trade_id = self._memory.get_trade_count()
+                self._graph_memory.record_trade(graph_trade, trade_id)
+            except Exception as e:
+                logger.debug("Graph memory record failed: %s", e)
 
         # Record individual model predictions for accuracy tracking
         actual_direction = 1.0 if pnl > 0 else (-1.0 if pnl < 0 else 0.0)
@@ -833,6 +896,8 @@ class SelfLearningAgent:
     def close(self) -> None:
         """Clean up resources."""
         self._memory.close()
+        if self._graph_memory is not None:
+            self._graph_memory.close()
 
     def __repr__(self) -> str:
         active_models = []

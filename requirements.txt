@@ -29,6 +29,9 @@ seaborn>=0.12
 gymnasium>=0.29
 stable-baselines3>=2.0  # NOTE: requires torch>=2.0; pin torch<2.5 if SB3<2.4
 
+# Optional: Graph-based relational memory
+networkx>=3.0
+
 # Optional: Statistical analysis
 statsmodels>=0.14
 scipy>=1.11

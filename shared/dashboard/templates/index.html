@@ -1,0 +1,515 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Graphify Memory Dashboard</title>
+<script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#c9d1d9;font-family:'Segoe UI',system-ui,-apple-system,sans-serif;height:100vh;overflow:hidden}
+.header{background:#161b22;border-bottom:1px solid #30363d;padding:10px 20px;display:flex;align-items:center;justify-content:space-between;height:50px}
+.header h1{font-size:16px;color:#58a6ff;font-weight:600;letter-spacing:1px}
+.header button{background:#238636;color:#fff;border:none;padding:6px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500}
+.header button:hover{background:#2ea043}
+.main{display:flex;height:calc(100vh - 50px)}
+.sidebar{width:320px;min-width:320px;background:#161b22;border-right:1px solid #30363d;overflow-y:auto;padding:12px}
+.graph-container{flex:1;position:relative}
+#graph-canvas{width:100%;height:100%;background:#0d1117}
+.panel{background:#0d1117;border:1px solid #30363d;border-radius:8px;margin-bottom:12px;overflow:hidden}
+.panel-header{background:#21262d;padding:8px 12px;font-size:12px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:0.5px;display:flex;align-items:center;gap:6px}
+.panel-body{padding:10px 12px;font-size:13px;line-height:1.6}
+.stat-row{display:flex;justify-content:space-between;padding:2px 0}
+.stat-label{color:#8b949e}
+.stat-value{color:#c9d1d9;font-weight:500}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;margin:2px}
+.badge-regime{background:#e74c3c33;color:#e74c3c}
+.badge-symbol{background:#3498db33;color:#3498db}
+.badge-strategy{background:#9b59b633;color:#9b59b6}
+.badge-trade{background:#2ecc7133;color:#2ecc71}
+.badge-feature{background:#95a5a633;color:#95a5a6}
+table.transition-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:4px}
+table.transition-table th,table.transition-table td{padding:4px 6px;text-align:left;border-bottom:1px solid #21262d}
+table.transition-table th{color:#8b949e;font-weight:500}
+.prob-bar{display:inline-block;height:8px;border-radius:4px;background:#e74c3c;margin-right:6px;vertical-align:middle}
+.strategy-card{background:#21262d;border-radius:6px;padding:8px 10px;margin-top:6px}
+.strategy-card .name{color:#9b59b6;font-weight:600;font-size:13px}
+.strategy-card .regime-label{color:#e74c3c;font-size:11px}
+.strategy-card .metrics{display:flex;gap:12px;margin-top:4px;font-size:12px}
+.strategy-card .metric-val{color:#58a6ff;font-weight:600}
+.filter-group{display:flex;flex-wrap:wrap;gap:6px;padding:4px 0}
+.filter-group label{display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer}
+.filter-group input[type=checkbox]{accent-color:#58a6ff}
+.detail-panel{background:#161b22;border-top:1px solid #30363d;position:absolute;bottom:0;left:0;right:0;max-height:200px;overflow-y:auto;padding:12px;display:none;z-index:10}
+.detail-panel.active{display:block}
+.detail-panel h3{font-size:13px;color:#58a6ff;margin-bottom:6px}
+.detail-panel .attrs{display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;font-size:12px}
+.detail-panel .attr-key{color:#8b949e}
+.detail-panel .attr-val{color:#c9d1d9}
+.detail-panel .neighbors{margin-top:8px;font-size:12px}
+.detail-panel .neighbors span{color:#58a6ff;cursor:pointer;margin-right:8px}
+.detail-panel .neighbors span:hover{text-decoration:underline}
+.physics-toggle{display:flex;align-items:center;gap:6px;font-size:12px}
+.physics-toggle input{accent-color:#58a6ff}
+.loading{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);color:#8b949e;font-size:14px}
+
+/* Connection status indicator */
+.ws-status{display:flex;align-items:center;gap:6px;font-size:12px;color:#8b949e}
+.ws-dot{width:8px;height:8px;border-radius:50%;background:#da3633;transition:background 0.3s}
+.ws-dot.connected{background:#2ea043;animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+
+/* Toast notifications */
+.toast-container{position:fixed;top:60px;right:20px;z-index:1000;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{background:#161b22;border:1px solid #30363d;border-left:3px solid #2ea043;border-radius:6px;padding:10px 14px;font-size:13px;color:#c9d1d9;min-width:280px;max-width:380px;box-shadow:0 4px 12px rgba(0,0,0,.4);pointer-events:auto;animation:slideIn .3s ease-out;transition:opacity .3s,transform .3s}
+.toast.trade-win{border-left-color:#2ea043}
+.toast.trade-loss{border-left-color:#e67e22}
+.toast.regime{border-left-color:#e74c3c}
+.toast.correlation{border-left-color:#f39c12}
+.toast.removing{opacity:0;transform:translateX(100px)}
+@keyframes slideIn{from{opacity:0;transform:translateX(100px)}to{opacity:1;transform:translateX(0)}}
+.toast-title{font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:2px;color:#8b949e}
+.toast-body{color:#c9d1d9}
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>&#x1F4CA; GRAPHIFY MEMORY DASHBOARD</h1>
+    <div style="display:flex;align-items:center;gap:16px">
+        <div class="ws-status">
+            <span class="ws-dot" id="ws-dot"></span>
+            <span id="ws-label">Disconnected</span>
+        </div>
+        <div class="physics-toggle">
+            <input type="checkbox" id="physics-toggle" checked>
+            <label for="physics-toggle">Physics</label>
+        </div>
+        <button id="refresh-btn" onclick="loadAll()">&#x21BB; Refresh</button>
+    </div>
+</div>
+<div class="main">
+    <div class="sidebar">
+        <div class="panel">
+            <div class="panel-header">&#x1F4CA; Graph Stats</div>
+            <div class="panel-body" id="stats-panel">Loading...</div>
+        </div>
+        <div class="panel">
+            <div class="panel-header">&#x1F50D; Filter Nodes</div>
+            <div class="panel-body">
+                <div class="filter-group" id="filters"></div>
+            </div>
+        </div>
+        <div class="panel">
+            <div class="panel-header">&#x1F504; Regime Transitions</div>
+            <div class="panel-body" id="transitions-panel">Loading...</div>
+        </div>
+        <div class="panel">
+            <div class="panel-header">&#x1F3AF; Best Strategies</div>
+            <div class="panel-body" id="strategies-panel">Loading...</div>
+        </div>
+    </div>
+    <div class="graph-container">
+        <div id="graph-canvas"><div class="loading">Loading graph...</div></div>
+        <div class="detail-panel" id="detail-panel">
+            <h3 id="detail-title">Node Detail</h3>
+            <div class="attrs" id="detail-attrs"></div>
+            <div class="neighbors" id="detail-neighbors"></div>
+        </div>
+    </div>
+</div>
+<div class="toast-container" id="toast-container"></div>
+
+<script>
+let network = null;
+let nodesDataset = null;
+let edgesDataset = null;
+let allNodes = [];
+let allEdges = [];
+
+const NODE_TYPES = ['regime','symbol','strategy','trade','feature_state'];
+const TYPE_COLORS = {
+    regime: '#e74c3c', symbol: '#3498db', strategy: '#9b59b6',
+    trade: '#2ecc71', feature_state: '#95a5a6'
+};
+
+function initFilters() {
+    const container = document.getElementById('filters');
+    container.innerHTML = NODE_TYPES.map(t => {
+        const col = TYPE_COLORS[t];
+        return '<label><input type="checkbox" checked data-type="' + t + '" onchange="applyFilters()">' +
+               '<span style="color:' + col + '">' + t + '</span></label>';
+    }).join('');
+}
+
+function applyFilters() {
+    const checks = document.querySelectorAll('#filters input[type=checkbox]');
+    const visible = new Set();
+    checks.forEach(c => { if (c.checked) visible.add(c.dataset.type); });
+
+    allNodes.forEach(n => {
+        nodesDataset.update({id: n.id, hidden: !visible.has(n.group)});
+    });
+}
+
+async function fetchJSON(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(res.statusText);
+    return res.json();
+}
+
+async function loadGraph() {
+    const data = await fetchJSON('/api/graph');
+    allNodes = data.nodes;
+    allEdges = data.edges;
+
+    nodesDataset = new vis.DataSet(allNodes);
+    edgesDataset = new vis.DataSet(allEdges);
+
+    const container = document.getElementById('graph-canvas');
+    container.innerHTML = '';
+
+    const options = {
+        nodes: {
+            font: {color: '#c9d1d9', size: 11, face: 'Segoe UI'},
+            borderWidth: 1,
+            borderWidthSelected: 3
+        },
+        edges: {
+            font: {color: '#8b949e', size: 9, face: 'Segoe UI', strokeWidth: 0},
+            smooth: {type: 'continuous'}
+        },
+        physics: {
+            enabled: document.getElementById('physics-toggle').checked,
+            barnesHut: {
+                gravitationalConstant: -4000,
+                centralGravity: 0.3,
+                springLength: 120,
+                springConstant: 0.04,
+                damping: 0.09
+            },
+            stabilization: {iterations: 150}
+        },
+        interaction: {
+            hover: true,
+            tooltipDelay: 200,
+            multiselect: false,
+            navigationButtons: false,
+            keyboard: true
+        },
+        layout: {improvedLayout: true}
+    };
+
+    network = new vis.Network(container, {nodes: nodesDataset, edges: edgesDataset}, options);
+
+    network.on('click', function(params) {
+        if (params.nodes.length > 0) {
+            showNodeDetail(params.nodes[0]);
+        } else {
+            document.getElementById('detail-panel').classList.remove('active');
+        }
+    });
+
+    document.getElementById('physics-toggle').addEventListener('change', function() {
+        network.setOptions({physics: {enabled: this.checked}});
+    });
+}
+
+function showNodeDetail(nodeId) {
+    const node = allNodes.find(n => n.id === nodeId);
+    if (!node) return;
+
+    const panel = document.getElementById('detail-panel');
+    document.getElementById('detail-title').textContent = node.label + ' (' + node.group + ')';
+
+    const attrs = document.getElementById('detail-attrs');
+    const raw = node.raw || {};
+    attrs.innerHTML = Object.entries(raw).map(function(entry) {
+        let val = entry[1];
+        if (typeof val === 'number') val = Math.round(val * 10000) / 10000;
+        return '<span class="attr-key">' + entry[0] + ':</span><span class="attr-val">' + val + '</span>';
+    }).join('');
+
+    const neighbors = document.getElementById('detail-neighbors');
+    const connected = network.getConnectedNodes(nodeId);
+    if (connected.length > 0) {
+        neighbors.innerHTML = '<strong>Neighbors:</strong> ' +
+            connected.map(function(cid) {
+                const cn = allNodes.find(n => n.id === cid);
+                const lbl = cn ? cn.label : cid;
+                return '<span onclick="network.selectNodes([\'' + cid + '\']);showNodeDetail(\'' + cid + '\')">' + lbl + '</span>';
+            }).join('');
+    } else {
+        neighbors.innerHTML = '<em>No connections</em>';
+    }
+
+    panel.classList.add('active');
+}
+
+async function loadStats() {
+    const stats = await fetchJSON('/api/stats');
+    const panel = document.getElementById('stats-panel');
+    let html = '';
+    html += '<div class="stat-row"><span class="stat-label">Nodes</span><span class="stat-value">' + stats.total_nodes + '</span></div>';
+    html += '<div class="stat-row"><span class="stat-label">Edges</span><span class="stat-value">' + stats.total_edges + '</span></div>';
+    html += '<div class="stat-row"><span class="stat-label">Density</span><span class="stat-value">' + stats.density + '</span></div>';
+
+    if (stats.node_types) {
+        html += '<div style="margin-top:8px;font-size:12px;color:#8b949e">Node types:</div>';
+        Object.entries(stats.node_types).forEach(function(entry) {
+            const cls = 'badge-' + (entry[0] === 'feature_state' ? 'feature' : entry[0]);
+            html += '<span class="badge ' + cls + '">' + entry[0] + ': ' + entry[1] + '</span>';
+        });
+    }
+    if (stats.edge_types) {
+        html += '<div style="margin-top:8px;font-size:12px;color:#8b949e">Edge types:</div>';
+        Object.entries(stats.edge_types).forEach(function(entry) {
+            html += '<div class="stat-row"><span class="stat-label">' + entry[0] + '</span><span class="stat-value">' + entry[1] + '</span></div>';
+        });
+    }
+    panel.innerHTML = html;
+}
+
+async function loadTransitions() {
+    const data = await fetchJSON('/api/transitions');
+    const panel = document.getElementById('transitions-panel');
+    const transitions = data.transitions;
+
+    if (!transitions || Object.keys(transitions).length === 0) {
+        panel.innerHTML = '<em style="color:#8b949e">No transitions recorded</em>';
+        return;
+    }
+
+    let html = '<table class="transition-table"><tr><th>From</th><th>To</th><th>Prob</th></tr>';
+    Object.entries(transitions).forEach(function(entry) {
+        const from = entry[0];
+        const targets = entry[1];
+        Object.entries(targets).forEach(function(t) {
+            const pct = (t[1] * 100).toFixed(1);
+            const barW = Math.max(4, t[1] * 80);
+            html += '<tr><td style="color:#e74c3c">' + from + '</td><td style="color:#e74c3c">' + t[0] + '</td>' +
+                    '<td><span class="prob-bar" style="width:' + barW + 'px"></span>' + pct + '%</td></tr>';
+        });
+    });
+    html += '</table>';
+    panel.innerHTML = html;
+}
+
+async function loadStrategies() {
+    const data = await fetchJSON('/api/strategies');
+    const panel = document.getElementById('strategies-panel');
+    const strategies = data.strategies;
+
+    if (!strategies || Object.keys(strategies).length === 0) {
+        panel.innerHTML = '<em style="color:#8b949e">No strategies recorded</em>';
+        return;
+    }
+
+    let html = '';
+    Object.entries(strategies).forEach(function(entry) {
+        const regime = entry[0];
+        const s = entry[1];
+        const wrPct = (s.win_rate * 100).toFixed(1);
+        html += '<div class="strategy-card">' +
+                '<div class="name">' + s.strategy + '</div>' +
+                '<div class="regime-label">in ' + regime + '</div>' +
+                '<div class="metrics">' +
+                '<div>WR: <span class="metric-val">' + wrPct + '%</span></div>' +
+                '<div>PnL: <span class="metric-val">' + s.avg_pnl.toFixed(2) + '</span></div>' +
+                '<div>Score: <span class="metric-val">' + s.score.toFixed(4) + '</span></div>' +
+                '<div>Trades: <span class="metric-val">' + s.trade_count + '</span></div>' +
+                '</div></div>';
+    });
+    panel.innerHTML = html;
+}
+
+async function loadAll() {
+    try {
+        await Promise.all([loadGraph(), loadStats(), loadTransitions(), loadStrategies()]);
+    } catch (e) {
+        console.error('Dashboard load error:', e);
+    }
+}
+
+// ─── WebSocket Client with Auto-Reconnect ───
+
+let ws = null;
+let wsReconnectDelay = 1000;
+const WS_MAX_DELAY = 30000;
+
+function connectWebSocket() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url = proto + '//' + location.host + '/ws';
+    ws = new WebSocket(url);
+
+    ws.onopen = function() {
+        wsReconnectDelay = 1000;
+        setWsStatus(true);
+    };
+
+    ws.onclose = function() {
+        setWsStatus(false);
+        scheduleReconnect();
+    };
+
+    ws.onerror = function() {
+        ws.close();
+    };
+
+    ws.onmessage = function(evt) {
+        try {
+            const msg = JSON.parse(evt.data);
+            if (msg.type === 'graph_update') {
+                handleGraphUpdate(msg.event, msg.data);
+            }
+        } catch (e) {
+            console.error('WS message parse error:', e);
+        }
+    };
+}
+
+function scheduleReconnect() {
+    setTimeout(function() {
+        connectWebSocket();
+        wsReconnectDelay = Math.min(wsReconnectDelay * 2, WS_MAX_DELAY);
+    }, wsReconnectDelay);
+}
+
+function setWsStatus(connected) {
+    const dot = document.getElementById('ws-dot');
+    const label = document.getElementById('ws-label');
+    if (connected) {
+        dot.classList.add('connected');
+        label.textContent = 'Connected';
+        label.style.color = '#2ea043';
+    } else {
+        dot.classList.remove('connected');
+        label.textContent = 'Disconnected';
+        label.style.color = '#da3633';
+    }
+}
+
+// ─── Handle Real-Time Graph Updates ───
+
+function handleGraphUpdate(event, data) {
+    if (event === 'trade_recorded') {
+        handleTradeRecorded(data);
+    } else if (event === 'regime_transition') {
+        showToast('Regime Transition',
+            data.from_regime + ' \u2192 ' + data.to_regime, 'regime');
+        loadAll();
+    } else if (event === 'correlations_updated' || event === 'file_changed') {
+        if (event === 'correlations_updated') {
+            showToast('Correlations Updated',
+                (data.symbols || []).join(', '), 'correlation');
+        }
+        loadAll();
+    }
+}
+
+function handleTradeRecorded(data) {
+    var pnlStr = (data.pnl >= 0 ? '+' : '') + Number(data.pnl).toFixed(2);
+    var cls = data.is_winner ? 'trade-win' : 'trade-loss';
+    showToast('Trade Recorded',
+        'T' + data.trade_id + ' — ' + data.symbol + ' ' + data.action + ' ' + pnlStr, cls);
+
+    // Incremental update: add the new trade node + edges to the vis.js DataSet
+    if (!nodesDataset || !edgesDataset) {
+        loadAll();
+        return;
+    }
+
+    var tradeNodeId = 'trade:' + data.trade_id;
+    var color = data.is_winner ? '#2ecc71' : '#e67e22';
+    var titleParts = [
+        '<b>T' + data.trade_id + '</b>',
+        'Type: trade',
+        'action: ' + data.action,
+        'pnl: ' + Number(data.pnl).toFixed(4),
+        'is_winner: ' + data.is_winner
+    ];
+
+    // Add trade node
+    nodesDataset.add({
+        id: tradeNodeId,
+        label: 'T' + data.trade_id,
+        group: 'trade',
+        title: titleParts.join('<br>'),
+        color: color,
+        shape: 'dot',
+        size: 12,
+        raw: data
+    });
+    allNodes.push({id: tradeNodeId, label: 'T' + data.trade_id, group: 'trade', raw: data});
+
+    // Add edges to regime and symbol nodes
+    var regimeNodeId = 'regime:' + data.regime;
+    var symbolNodeId = 'symbol:' + data.symbol;
+
+    var newEdges = [];
+    if (nodesDataset.get(regimeNodeId)) {
+        newEdges.push({
+            from: tradeNodeId, to: regimeNodeId,
+            label: 'traded in', color: {color: '#7f8c8d'},
+            dashes: [5,5], width: 1, arrows: 'to'
+        });
+    }
+    if (nodesDataset.get(symbolNodeId)) {
+        newEdges.push({
+            from: tradeNodeId, to: symbolNodeId,
+            label: 'traded symbol', color: {color: '#3498db'},
+            dashes: [5,5], width: 1, arrows: 'to'
+        });
+    }
+    if (newEdges.length > 0) {
+        edgesDataset.add(newEdges);
+    }
+
+    // Refresh sidebar stats
+    loadStats();
+    loadStrategies();
+}
+
+// ─── Toast Notification System ───
+
+var toastQueue = [];
+var MAX_TOASTS = 3;
+
+function showToast(title, body, cls) {
+    var container = document.getElementById('toast-container');
+
+    // Evict oldest if at max
+    while (toastQueue.length >= MAX_TOASTS) {
+        var oldest = toastQueue.shift();
+        if (oldest && oldest.el && oldest.el.parentNode) {
+            oldest.el.classList.add('removing');
+            setTimeout(function() { if (oldest.el.parentNode) oldest.el.parentNode.removeChild(oldest.el); }, 300);
+        }
+        if (oldest && oldest.timer) clearTimeout(oldest.timer);
+    }
+
+    var el = document.createElement('div');
+    el.className = 'toast ' + (cls || '');
+    el.innerHTML = '<div class="toast-title">' + title + '</div><div class="toast-body">' + body + '</div>';
+    container.appendChild(el);
+
+    var entry = {el: el, timer: null};
+    entry.timer = setTimeout(function() {
+        el.classList.add('removing');
+        setTimeout(function() {
+            if (el.parentNode) el.parentNode.removeChild(el);
+            var idx = toastQueue.indexOf(entry);
+            if (idx > -1) toastQueue.splice(idx, 1);
+        }, 300);
+    }, 4000);
+
+    toastQueue.push(entry);
+}
+
+// ─── Init ───
+
+initFilters();
+loadAll();
+connectWebSocket();
+</script>
+</body>
+</html>
