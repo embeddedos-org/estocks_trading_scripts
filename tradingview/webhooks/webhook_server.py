@@ -6,6 +6,8 @@ and routes orders to configured broker adapters.
 stocks_plugin - tradingview/webhooks/webhook_server.py
 """
 
+from __future__ import annotations
+
 import hashlib
 import hmac
 import json
