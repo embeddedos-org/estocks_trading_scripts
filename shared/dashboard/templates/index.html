@@ -441,7 +441,7 @@ function handleTradeRecorded(data) {
     });
     allNodes.push({id: tradeNodeId, label: 'T' + data.trade_id, group: 'trade', raw: data});
 
-    // Add edges to regime and symbol nodes
+    // Add edges to regime, symbol, and strategy nodes
     var regimeNodeId = 'regime:' + data.regime;
     var symbolNodeId = 'symbol:' + data.symbol;
 
@@ -459,6 +459,16 @@ function handleTradeRecorded(data) {
             label: 'traded symbol', color: {color: '#3498db'},
             dashes: [5,5], width: 1, arrows: 'to'
         });
+    }
+    if (data.decision_source) {
+        var strategyNodeId = 'strategy:' + data.decision_source;
+        if (nodesDataset.get(strategyNodeId)) {
+            newEdges.push({
+                from: tradeNodeId, to: strategyNodeId,
+                label: 'used strategy', color: {color: '#8e44ad'},
+                dashes: [5,5], width: 1, arrows: 'to'
+            });
+        }
     }
     if (newEdges.length > 0) {
         edgesDataset.add(newEdges);

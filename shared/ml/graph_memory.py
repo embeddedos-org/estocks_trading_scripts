@@ -299,11 +299,20 @@ class GraphMemory:
                 g.add_edge(feature_id, regime_id, type=EdgeType.CORRELATES_WITH.value, count=1)
 
             # Regime transition tracking
+            _transition_from = None
             if self._last_regime is not None and self._last_regime != regime:
-                self.record_regime_transition(self._last_regime, regime)
+                _transition_from = self._last_regime
+                self._record_regime_transition_locked(self._last_regime, regime)
             self._last_regime = regime
 
         self._maybe_autosave()
+
+        # Fire notifications outside the lock to prevent deadlocks
+        if _transition_from is not None:
+            self._notify_change("regime_transition", {
+                "from_regime": _transition_from,
+                "to_regime": regime,
+            })
         self._notify_change("trade_recorded", {
             "trade_id": trade_id,
             "regime": regime,
@@ -311,27 +320,21 @@ class GraphMemory:
             "action": action,
             "pnl": pnl,
             "is_winner": is_winner,
+            "decision_source": strategy,
         })
 
-    def record_regime_transition(
+    def _record_regime_transition_locked(
         self,
         from_regime: str,
         to_regime: str,
         duration_bars: int = 0,
     ) -> None:
-        """Record a regime-to-regime transition.
-
-        Args:
-            from_regime: Regime being exited.
-            to_regime: Regime being entered.
-            duration_bars: How many bars the previous regime lasted.
-        """
+        """Record transition edge (must be called with self._lock held)."""
         from_id = _node_id(NodeType.REGIME, from_regime)
         to_id = _node_id(NodeType.REGIME, to_regime)
 
         g = self._graph
 
-        # Ensure regime nodes exist
         for nid, label in ((from_id, from_regime), (to_id, to_regime)):
             if not g.has_node(nid):
                 g.add_node(nid, type=NodeType.REGIME.value, label=label, trade_count=0, total_pnl=0.0, wins=0)
@@ -351,6 +354,22 @@ class GraphMemory:
                 count=1,
                 avg_duration_bars=float(duration_bars),
             )
+
+    def record_regime_transition(
+        self,
+        from_regime: str,
+        to_regime: str,
+        duration_bars: int = 0,
+    ) -> None:
+        """Record a regime-to-regime transition.
+
+        Args:
+            from_regime: Regime being exited.
+            to_regime: Regime being entered.
+            duration_bars: How many bars the previous regime lasted.
+        """
+        with self._lock:
+            self._record_regime_transition_locked(from_regime, to_regime, duration_bars)
 
         self._notify_change("regime_transition", {
             "from_regime": from_regime,

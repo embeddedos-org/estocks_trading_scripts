@@ -387,6 +387,7 @@ class SelfLearningAgent:
             best_strat = graph_insight.get("best_strategy")
             if best_strat and best_strat.get("win_rate", 0) < 0.4 and signal.confidence < 0.6:
                 action = "HOLD"
+                self._pending_trade["action"] = "HOLD"
                 logger.info("Graph override: strategy win_rate=%.2f in %s, holding", best_strat["win_rate"], regime)
 
         decision = {
