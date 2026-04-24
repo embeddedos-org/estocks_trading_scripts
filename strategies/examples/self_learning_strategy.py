@@ -60,6 +60,7 @@ class SelfLearningConfig:
     min_confidence: float = 0.3
     adaptive_thresholds: bool = True
     stop_loss_pct: float = 0.05  # 5% stop loss
+    use_enricher: bool = True
 
 
 @register_strategy("self_learning")
@@ -85,6 +86,13 @@ class SelfLearningStrategy:
         self._trained = False
         self._fallback = False
         self._entry_prices: Dict[str, float] = {}
+        self._enricher = None
+        if self.config.use_enricher:
+            try:
+                from shared.strategy_enricher import StrategyEnricher
+                self._enricher = StrategyEnricher()
+            except Exception:
+                pass
 
         # Create agent
         try:
@@ -152,7 +160,19 @@ class SelfLearningStrategy:
                     continue
 
             if self._fallback or self._agent is None:
-                signals[sym] = self._momentum_signal(df)
+                # Enricher gate
+                enricher_ok = True
+                if getattr(self, "_enricher", None) and current_pos == 0:
+                    enriched = self._enricher.enrich(sym, df)
+                    blocked, _ = self._enricher.should_block_entry(enriched)
+                    if blocked:
+                        enricher_ok = False
+
+                raw_signal = self._momentum_signal(df)
+                if not enricher_ok and raw_signal != 0 and current_pos == 0:
+                    signals[sym] = 0
+                else:
+                    signals[sym] = raw_signal
                 if signals[sym] == 1 and current_pos <= 0:
                     self._entry_prices[sym] = current_price
                 elif signals[sym] == -1 and current_pos >= 0:
@@ -160,10 +180,18 @@ class SelfLearningStrategy:
                 continue
 
             try:
+                # Enricher gate for new entries
+                enricher_ok = True
+                if getattr(self, "_enricher", None) and current_pos == 0:
+                    enriched = self._enricher.enrich(sym, df)
+                    blocked, _ = self._enricher.should_block_entry(enriched)
+                    if blocked:
+                        enricher_ok = False
+
                 decision = self._agent.decide(df, symbol=sym)
                 action = decision.get("action", "HOLD")
 
-                if action == "BUY":
+                if action == "BUY" and enricher_ok:
                     signals[sym] = 1
                     self._entry_prices[sym] = current_price
                 elif action == "SELL":

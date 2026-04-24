@@ -62,7 +62,8 @@ class MLConfig:
     hidden_size: int = 64
     threshold: float = 0.0
     prediction_threshold: float = 0.005
-    trailing_stop_pct: float = 0.05  # 5% trailing stop
+    trailing_stop_pct: float = 0.05
+    use_enricher: bool = True
 
 
 @register_strategy("ml")
@@ -81,6 +82,13 @@ class MLStrategy:
         self._fallback = not _HAS_TORCH
         self._entry_prices: Dict[str, float] = {}
         self._peak_prices: Dict[str, float] = {}
+        self._enricher = None
+        if self.config.use_enricher:
+            try:
+                from shared.strategy_enricher import StrategyEnricher
+                self._enricher = StrategyEnricher()
+            except Exception:
+                pass
 
         if _HAS_TORCH:
             try:
@@ -153,11 +161,19 @@ class MLStrategy:
                         continue
 
             if self._fallback:
+                # Enricher gate for new entries
+                enricher_ok = True
+                if getattr(self, "_enricher", None) and current_pos == 0:
+                    enriched = self._enricher.enrich(sym, df)
+                    blocked, _ = self._enricher.should_block_entry(enriched)
+                    if blocked:
+                        enricher_ok = False
+
                 close = df["close"]
                 mom_20 = float(close.iloc[-1] / close.iloc[-20] - 1) if len(df) >= 20 else 0
                 mom_5 = float(close.iloc[-1] / close.iloc[-5] - 1) if len(df) >= 5 else 0
                 score = 0.6 * mom_20 + 0.4 * mom_5
-                if score > 0.01:
+                if score > 0.01 and enricher_ok:
                     signals[sym] = 1
                     if current_pos <= 0:
                         self._entry_prices[sym] = current_price
@@ -171,10 +187,18 @@ class MLStrategy:
                     signals[sym] = 0
             else:
                 try:
+                    # Enricher gate for new entries
+                    enricher_ok = True
+                    if getattr(self, "_enricher", None) and current_pos == 0:
+                        enriched = self._enricher.enrich(sym, df)
+                        blocked, _ = self._enricher.should_block_entry(enriched)
+                        if blocked:
+                            enricher_ok = False
+
                     preds = self._predictor.predict(df)
                     if preds is not None and len(preds) > 0:
                         pred = float(preds[-1]) if hasattr(preds, '__len__') else float(preds)
-                        if pred > threshold:
+                        if pred > threshold and enricher_ok:
                             signals[sym] = 1
                             if current_pos <= 0:
                                 self._entry_prices[sym] = current_price
@@ -202,6 +226,7 @@ class RLConfig:
     total_timesteps: int = 50_000
     reward_type: str = "pnl"
     trailing_stop_pct: float = 0.05  # 5% trailing stop
+    use_enricher: bool = True
 
 
 @register_strategy("rl")
@@ -218,6 +243,13 @@ class RLStrategy:
         self._fallback = not _HAS_SB3
         self._entry_prices: Dict[str, float] = {}
         self._peak_prices: Dict[str, float] = {}
+        self._enricher = None
+        if self.config.use_enricher:
+            try:
+                from shared.strategy_enricher import StrategyEnricher
+                self._enricher = StrategyEnricher()
+            except Exception:
+                pass
 
         if _HAS_SB3:
             try:
@@ -274,10 +306,18 @@ class RLStrategy:
                         continue
 
             if self._fallback:
+                # Enricher gate for new entries
+                enricher_ok = True
+                if getattr(self, "_enricher", None) and current_pos == 0:
+                    enriched = self._enricher.enrich(sym, df)
+                    blocked, _ = self._enricher.should_block_entry(enriched)
+                    if blocked:
+                        enricher_ok = False
+
                 close = df["close"]
                 rsi = TI.rsi(close, 14)
                 current_rsi = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else 50.0
-                if current_rsi < 35:
+                if current_rsi < 35 and enricher_ok:
                     signals[sym] = 1
                     if current_pos <= 0:
                         self._entry_prices[sym] = current_price

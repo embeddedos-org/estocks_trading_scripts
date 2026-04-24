@@ -53,6 +53,7 @@ class BreakoutConfig:
     confirm_bars: int = 1
     use_mtf_filter: bool = True
     htf_period: str = "1D"
+    use_enricher: bool = True
 
 
 @register_strategy("breakout")
@@ -67,8 +68,15 @@ class BreakoutStrategy:
     def __init__(self, config: BreakoutConfig | None = None) -> None:
         self.config = config or BreakoutConfig()
         self._trailing_stops: Dict[str, float] = {}
-        self._breakout_bars: Dict[str, int] = {}  # bars since breakout signal
+        self._breakout_bars: Dict[str, int] = {}
         self._mtf = MultiTimeframeTrend(htf_period=self.config.htf_period)
+        self._enricher = None
+        if self.config.use_enricher:
+            try:
+                from shared.strategy_enricher import StrategyEnricher
+                self._enricher = StrategyEnricher()
+            except Exception:
+                pass
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "BreakoutStrategy":
@@ -139,9 +147,17 @@ class BreakoutStrategy:
                 mtf_sell_ok = self._mtf.is_aligned(df, "SELL")
 
             # Entry logic with confirmation bars
+            # Enricher gate: check sentiment, fundamentals, earnings before new entry
+            enricher_ok = True
+            if getattr(self, "_enricher", None) and current_pos == 0:
+                enriched = self._enricher.enrich(sym, df)
+                blocked, reason = self._enricher.should_block_entry(enriched)
+                if blocked:
+                    enricher_ok = False
+
             if current_pos == 0:
                 # Long breakout
-                if current_close > dc_upper and volume_spike and mtf_buy_ok:
+                if current_close > dc_upper and volume_spike and mtf_buy_ok and enricher_ok:
                     bars_above = self._breakout_bars.get(sym, 0) + 1
                     self._breakout_bars[sym] = bars_above
                     if bars_above >= cfg.confirm_bars:

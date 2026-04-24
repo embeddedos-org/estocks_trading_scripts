@@ -57,6 +57,7 @@ class MeanReversionConfig:
     adx_trending_threshold: int = 30  # skip all entries when ADX > this (trending market)
     use_mtf_filter: bool = True
     htf_period: str = "1D"
+    use_enricher: bool = True
 
 
 @register_strategy("mean_reversion")
@@ -72,6 +73,13 @@ class MeanReversionStrategy:
         self.config = config or MeanReversionConfig()
         self._entry_prices: Dict[str, float] = {}
         self._mtf = MultiTimeframeTrend(htf_period=self.config.htf_period)
+        self._enricher = None
+        if self.config.use_enricher:
+            try:
+                from shared.strategy_enricher import StrategyEnricher
+                self._enricher = StrategyEnricher()
+            except Exception:
+                pass
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "MeanReversionStrategy":
@@ -145,10 +153,18 @@ class MeanReversionStrategy:
 
             # Entry logic
             if current_pos == 0:
+                # Enricher gate
+                enricher_ok = True
+                if getattr(self, "_enricher", None):
+                    enriched = self._enricher.enrich(sym, df)
+                    blocked, reason = self._enricher.should_block_entry(enriched)
+                    if blocked:
+                        enricher_ok = False
+
                 bb_long_ok = current_close <= bb_lower if cfg.use_bb_confirm else True
                 bb_short_ok = current_close >= bb_upper if cfg.use_bb_confirm else True
 
-                if not adx_allows_entry or not mtf_allows_entry:
+                if not adx_allows_entry or not mtf_allows_entry or not enricher_ok:
                     signals[sym] = 0
                 elif current_rsi < cfg.rsi_oversold and bb_long_ok:
                     signals[sym] = 1

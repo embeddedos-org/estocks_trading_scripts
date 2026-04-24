@@ -149,13 +149,14 @@ class TestPositionSizing:
         assert shares == 50
 
     def test_fixed_dollar_low_price(self):
-        """Validates FIXED_DOLLAR with very low price gives many shares."""
+        """Validates FIXED_DOLLAR with very low price is capped by max_shares_per_order."""
         cfg = RiskManagerConfig(
             sizing_method=SizingMethod.FIXED_DOLLAR, fixed_dollar_amount=10000.0
         )
         rm = RiskManager(config=cfg)
         shares = rm.calculate_position_size("PENNY", 0.50)
-        assert shares == 20000
+        # Uncapped would be 20000 but max_shares_per_order=10000
+        assert shares == 10000
 
     def test_fixed_dollar_zero_price_returns_zero(self):
         """Validates FIXED_DOLLAR returns 0 for zero entry price."""
@@ -172,6 +173,7 @@ class TestPositionSizing:
     def test_fixed_fractional_with_stop(self):
         """Validates fixed fractional sizing with explicit stop price.
         risk = 100000 * 0.02 = 2000, risk_per_share = |150-140| = 10, shares = 200.
+        Capped by 25% equity: 100000*0.25/150 = 166.
         """
         cfg = RiskManagerConfig(
             sizing_method=SizingMethod.FIXED_FRACTIONAL,
@@ -180,10 +182,13 @@ class TestPositionSizing:
         )
         rm = RiskManager(config=cfg)
         shares = rm.calculate_position_size("AAPL", 150.0, stop_price=140.0)
-        assert shares == 200
+        # 200 shares * $150 = $30k > 25% of $100k, capped to 166
+        assert shares == 166
 
     def test_fixed_fractional_with_atr(self):
-        """Validates fixed fractional sizing using ATR (risk_per_share = atr * 2)."""
+        """Validates fixed fractional sizing using ATR (risk_per_share = atr * 2).
+        Capped by 25% equity.
+        """
         cfg = RiskManagerConfig(
             sizing_method=SizingMethod.FIXED_FRACTIONAL,
             risk_per_trade_pct=2.0,
@@ -191,23 +196,29 @@ class TestPositionSizing:
         )
         rm = RiskManager(config=cfg)
         shares = rm.calculate_position_size("AAPL", 150.0, atr=5.0)
-        assert shares == 200
+        # 200 shares * $150 = $30k > 25% cap, capped to 166
+        assert shares == 166
 
     def test_fixed_fractional_no_stop_no_atr_defaults_to_2pct(self):
         """Validates default 2% of price used when no stop/atr provided.
         risk = 100000 * 0.02 = 2000, risk_per_share = 150 * 0.02 = 3.0, shares = 666.
+        Capped by 25% equity: 100000*0.25/150 = 166.
         """
         cfg = RiskManagerConfig(total_capital=100000.0, risk_per_trade_pct=2.0)
         rm = RiskManager(config=cfg)
         shares = rm.calculate_position_size("AAPL", 150.0)
-        assert shares == 666
+        # 666 * $150 = $99.9k > 25% cap, capped to 166
+        assert shares == 166
 
     def test_fixed_fractional_stop_equals_entry_uses_default(self):
-        """Validates when stop == entry, falls through to default 2% risk."""
+        """Validates when stop == entry, falls through to default 2% risk.
+        Capped by 25% equity: 100000*0.25/100 = 250.
+        """
         cfg = RiskManagerConfig(total_capital=100000.0, risk_per_trade_pct=2.0)
         rm = RiskManager(config=cfg)
         shares = rm.calculate_position_size("AAPL", 100.0, stop_price=100.0)
-        assert shares == 1000
+        # 1000 * $100 = $100k > 25% cap, capped to 250
+        assert shares == 250
 
     def test_kelly_sizing(self):
         """Validates Kelly criterion position sizing with half-Kelly.
@@ -545,7 +556,8 @@ class TestGetStatus:
             "daily_trade_count", "consecutive_losses", "cooldown_active",
             "cooldown_remaining_s", "circuit_breaker_active", "drawdown_pct",
             "open_positions", "portfolio_heat_pct", "trades_last_hour",
-            "total_trades",
+            "total_trades", "monthly_pnl", "pyramid_positions",
+            "max_position_pct_equity", "max_shares_per_order", "enforce_market_hours",
         }
         assert expected_keys == set(status.keys())
 

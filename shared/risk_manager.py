@@ -76,6 +76,41 @@ class RiskManagerConfig:
     # Capital
     total_capital: float = 100000.0
 
+    # Pyramiding (Livermore — adding to winners)
+    enable_pyramiding: bool = False
+    max_pyramid_levels: int = 3
+    pyramid_threshold_pct: float = 2.0
+    pyramid_scale_factor: float = 0.5
+    pyramid_trail_stop_pct: float = 1.0
+
+    # Monthly risk cap (Elder's 6% rule)
+    max_monthly_loss: float = 0.0  # 0 = disabled; e.g., 6000.0 for 6% of $100k
+    monthly_reset_day: int = 1  # day of month to reset
+
+    # ─── Production Safety (Critical) ───
+
+    # Max position size caps
+    max_position_pct_equity: float = 25.0  # max % of equity in a single position
+    max_position_notional: float = 0.0  # 0 = disabled; hard dollar cap per position
+    max_shares_per_order: int = 10000  # fat-finger protection
+
+    # Pre-order price validation
+    max_price_deviation_pct: float = 10.0  # reject orders >10% from last price
+
+    # Short-selling limits
+    max_short_positions: int = 5
+    max_short_exposure_pct: float = 30.0  # max % of equity in total short exposure
+    require_short_stop: bool = True  # force buy-stop on all shorts
+
+    # Market hours enforcement
+    enforce_market_hours: bool = False  # True = block signals outside NYSE hours
+    allow_premarket: bool = False
+    allow_afterhours: bool = False
+
+    # Liquidity filter
+    min_avg_volume: int = 50000  # skip stocks with avg daily volume below this
+    max_position_pct_adv: float = 5.0  # max position as % of avg daily volume
+
     # State persistence (crash recovery)
     persist_path: Optional[str] = None
 
@@ -130,6 +165,16 @@ class RiskManager:
         # Trade history
         self._trade_history: List[TradeRecord] = []
 
+        # Pyramiding tracking
+        self._pyramid_counts: dict[str, int] = {}  # symbol -> number of adds
+
+        # Monthly risk cap tracking
+        self._monthly_pnl: float = 0.0
+        self._monthly_reset_date: date = self._next_monthly_reset()
+
+        # Thread safety — protects ALL mutable state
+        self._state_lock = threading.Lock()
+
         # State persistence
         self._persist_conn: Optional[sqlite3.Connection] = None
         self._persist_lock = threading.Lock()
@@ -169,6 +214,9 @@ class RiskManager:
             "cooldown_until": self._cooldown_until,
             "daily_trade_count": self._daily_trade_count,
             "open_positions": self._open_positions,
+            "pyramid_counts": self._pyramid_counts,
+            "monthly_pnl": self._monthly_pnl,
+            "monthly_reset_date": self._monthly_reset_date.isoformat(),
         }
 
         with self._persist_lock:
@@ -223,6 +271,22 @@ class RiskManager:
         if isinstance(positions, dict):
             self._open_positions = {k: float(v) for k, v in positions.items()}
 
+        # Restore pyramid counts
+        pyramid_counts = state.get("pyramid_counts")
+        if isinstance(pyramid_counts, dict):
+            self._pyramid_counts = {k: int(v) for k, v in pyramid_counts.items()}
+
+        # Restore monthly P&L
+        monthly_pnl = state.get("monthly_pnl")
+        if monthly_pnl is not None:
+            self._monthly_pnl = float(monthly_pnl)
+        monthly_reset = state.get("monthly_reset_date")
+        if monthly_reset:
+            try:
+                self._monthly_reset_date = date.fromisoformat(monthly_reset)
+            except (ValueError, TypeError):
+                pass
+
         logger.info(
             "Risk state restored: equity=$%.2f, daily_pnl=$%.2f, "
             "consecutive_losses=%d, positions=%d",
@@ -264,18 +328,50 @@ class RiskManager:
         method = self.config.sizing_method
 
         if method == SizingMethod.FIXED_SHARES:
-            return self.config.fixed_shares
+            return self._apply_position_caps(self.config.fixed_shares, entry_price)
 
         if method == SizingMethod.FIXED_DOLLAR:
             if entry_price <= 0:
                 return 0
-            return max(1, int(self.config.fixed_dollar_amount / entry_price))
+            raw = max(1, int(self.config.fixed_dollar_amount / entry_price))
+            return self._apply_position_caps(raw, entry_price)
 
         if method == SizingMethod.KELLY:
-            return self._kelly_size(entry_price)
+            raw = self._kelly_size(entry_price)
+            return self._apply_position_caps(raw, entry_price)
 
         # FIXED_FRACTIONAL (default)
-        return self._fixed_fractional_size(entry_price, stop_price, atr)
+        raw_size = self._fixed_fractional_size(entry_price, stop_price, atr)
+        return self._apply_position_caps(raw_size, entry_price)
+
+    def _apply_position_caps(self, shares: int, entry_price: float) -> int:
+        """Apply production safety caps to any position size.
+
+        Enforces:
+        - Max position as % of equity
+        - Max notional dollar cap
+        - Max shares per order (fat-finger)
+        """
+        if entry_price <= 0 or shares <= 0:
+            return shares
+
+        # Cap: max % of equity
+        max_by_equity = int(
+            self._current_equity * (self.config.max_position_pct_equity / 100.0) / entry_price
+        )
+        if max_by_equity > 0:
+            shares = min(shares, max_by_equity)
+
+        # Cap: max notional dollars
+        if self.config.max_position_notional > 0:
+            max_by_notional = int(self.config.max_position_notional / entry_price)
+            if max_by_notional > 0:
+                shares = min(shares, max_by_notional)
+
+        # Cap: max shares per order (fat-finger)
+        shares = min(shares, self.config.max_shares_per_order)
+
+        return max(1, shares)
 
     def _fixed_fractional_size(
         self,
@@ -389,6 +485,17 @@ class RiskManager:
             )
             return False
 
+        # Monthly loss cap (Elder's 6% rule)
+        if self.config.max_monthly_loss > 0:
+            self._reset_monthly_if_needed()
+            if self._monthly_pnl <= -self.config.max_monthly_loss:
+                logger.warning(
+                    "Monthly loss limit reached: $%.2f (max: $%.2f)",
+                    self._monthly_pnl,
+                    self.config.max_monthly_loss,
+                )
+                return False
+
         return True
 
     def check_portfolio_heat(self, additional_risk: float = 0.0) -> bool:
@@ -419,13 +526,13 @@ class RiskManager:
     def record_trade(self, symbol: str = "UNKNOWN", pnl: float = 0.0) -> None:
         """Record a completed trade for risk tracking.
 
-        Updates daily P&L, consecutive loss counter, equity tracking,
-        and trade frequency counters.
-
-        Args:
-            symbol: The traded symbol.
-            pnl: Realized P&L of the trade.
+        Thread-safe: acquires _state_lock to protect all mutable state.
         """
+        with self._state_lock:
+            self._record_trade_unlocked(symbol, pnl)
+
+    def _record_trade_unlocked(self, symbol: str, pnl: float) -> None:
+        """Internal record_trade without lock (called under _state_lock)."""
         self._reset_daily_if_needed()
 
         self._daily_pnl += pnl
@@ -486,6 +593,11 @@ class RiskManager:
                 self.config.circuit_breaker_pause_hours,
             )
 
+        # Monthly P&L tracking
+        if self.config.max_monthly_loss > 0:
+            self._reset_monthly_if_needed()
+            self._monthly_pnl += pnl
+
         # Record in history
         self._trade_history.append(TradeRecord(symbol=symbol, pnl=pnl))
         # FIX 9: Trim trade history to prevent unbounded growth
@@ -503,35 +615,25 @@ class RiskManager:
     # ─── Position Tracking ───
 
     def add_position(self, symbol: str, risk_amount: float) -> None:
-        """Register an open position's risk amount.
-
-        Args:
-            symbol: Ticker symbol.
-            risk_amount: Dollar amount at risk for this position.
-        """
-        self._open_positions[symbol] = risk_amount
-        logger.info(
-            "Position added: %s risk=$%.2f | Total positions: %d",
-            symbol,
-            risk_amount,
-            len(self._open_positions),
-        )
+        """Register an open position's risk amount. Thread-safe."""
+        with self._state_lock:
+            self._open_positions[symbol] = risk_amount
+            logger.info(
+                "Position added: %s risk=$%.2f | Total positions: %d",
+                symbol, risk_amount, len(self._open_positions),
+            )
         self._save_state()
 
     def remove_position(self, symbol: str) -> None:
-        """Remove a closed position from tracking.
-
-        Args:
-            symbol: Ticker symbol to remove.
-        """
-        if symbol in self._open_positions:
-            del self._open_positions[symbol]
-            logger.info(
-                "Position removed: %s | Remaining positions: %d",
-                symbol,
-                len(self._open_positions),
-            )
-            self._save_state()
+        """Remove a closed position from tracking. Thread-safe."""
+        with self._state_lock:
+            if symbol in self._open_positions:
+                del self._open_positions[symbol]
+                logger.info(
+                    "Position removed: %s | Remaining positions: %d",
+                    symbol, len(self._open_positions),
+                )
+        self._save_state()
 
     # ─── Status ───
 
@@ -569,7 +671,265 @@ class RiskManager:
             "portfolio_heat_pct": round(heat_pct, 2),
             "trades_last_hour": recent_trades_1h,
             "total_trades": len(self._trade_history),
+            "monthly_pnl": round(self._monthly_pnl, 2),
+            "pyramid_positions": len(self._pyramid_counts),
+            "max_position_pct_equity": self.config.max_position_pct_equity,
+            "max_shares_per_order": self.config.max_shares_per_order,
+            "enforce_market_hours": self.config.enforce_market_hours,
         }
+
+    # ─── Production Safety Gates ───
+
+    def validate_order(
+        self,
+        symbol: str,
+        shares: int,
+        price: float,
+        last_price: float,
+        direction: str = "LONG",
+        avg_daily_volume: Optional[float] = None,
+    ) -> tuple:
+        """Pre-order validation — catches fat-finger errors and unsafe orders.
+
+        Args:
+            symbol: Ticker symbol.
+            shares: Number of shares to order.
+            price: Intended order price.
+            last_price: Most recent market price for sanity check.
+            direction: "LONG" or "SHORT".
+            avg_daily_volume: Average daily volume for liquidity check.
+
+        Returns:
+            Tuple of (approved: bool, reason: str).
+            If approved, reason is "OK". Otherwise, describes the rejection.
+        """
+        # 1. Fat-finger: max shares per order
+        if abs(shares) > self.config.max_shares_per_order:
+            return False, (
+                f"Order size {shares} exceeds max_shares_per_order "
+                f"({self.config.max_shares_per_order})"
+            )
+
+        # 2. Price sanity: reject if price deviates >X% from last known price
+        if last_price > 0 and price > 0:
+            deviation_pct = abs(price - last_price) / last_price * 100
+            if deviation_pct > self.config.max_price_deviation_pct:
+                return False, (
+                    f"Price ${price:.2f} deviates {deviation_pct:.1f}% from "
+                    f"last price ${last_price:.2f} (max {self.config.max_price_deviation_pct}%)"
+                )
+
+        # 3. Max notional check
+        notional = abs(shares) * price
+        if self.config.max_position_notional > 0 and notional > self.config.max_position_notional:
+            return False, (
+                f"Notional ${notional:,.0f} exceeds max_position_notional "
+                f"(${self.config.max_position_notional:,.0f})"
+            )
+
+        # 4. Max position as % of equity
+        max_notional_by_equity = self._current_equity * (self.config.max_position_pct_equity / 100.0)
+        if notional > max_notional_by_equity:
+            return False, (
+                f"Notional ${notional:,.0f} exceeds {self.config.max_position_pct_equity}% "
+                f"of equity (${max_notional_by_equity:,.0f})"
+            )
+
+        # 5. Short-selling checks
+        if direction.upper() == "SHORT":
+            short_count = sum(
+                1 for v in self._open_positions.values() if v < 0
+            )
+            if short_count >= self.config.max_short_positions:
+                return False, (
+                    f"Max short positions reached ({self.config.max_short_positions})"
+                )
+
+            total_short_exposure = sum(
+                abs(v) for v in self._open_positions.values() if v < 0
+            )
+            new_short_pct = (
+                (total_short_exposure + notional) / self._current_equity * 100
+                if self._current_equity > 0 else 100
+            )
+            if new_short_pct > self.config.max_short_exposure_pct:
+                return False, (
+                    f"Short exposure would be {new_short_pct:.1f}% "
+                    f"(max {self.config.max_short_exposure_pct}%)"
+                )
+
+        # 6. Liquidity check
+        if avg_daily_volume is not None and avg_daily_volume > 0:
+            if avg_daily_volume < self.config.min_avg_volume:
+                return False, (
+                    f"Avg daily volume {avg_daily_volume:,.0f} below minimum "
+                    f"({self.config.min_avg_volume:,})"
+                )
+            position_pct_adv = abs(shares) / avg_daily_volume * 100
+            if position_pct_adv > self.config.max_position_pct_adv:
+                return False, (
+                    f"Position is {position_pct_adv:.1f}% of avg daily volume "
+                    f"(max {self.config.max_position_pct_adv}%)"
+                )
+
+        # 7. Standard risk gates
+        if not self.can_trade():
+            return False, "Risk gates blocked (can_trade=False)"
+
+        logger.info(
+            "Order validated: %s %s %d shares @ $%.2f (notional=$%,.0f)",
+            direction, symbol, shares, price, notional,
+        )
+        return True, "OK"
+
+    def check_market_hours(self) -> tuple:
+        """Check if trading is allowed based on current market hours.
+
+        Returns:
+            Tuple of (allowed: bool, reason: str).
+        """
+        if not self.config.enforce_market_hours:
+            return True, "Market hours enforcement disabled"
+
+        try:
+            from shared.data.public_data_fetcher import PublicDataFetcher
+            fetcher = PublicDataFetcher(cache_enabled=False)
+            if fetcher.is_market_open():
+                return True, "Market is open"
+
+            if self.config.allow_premarket or self.config.allow_afterhours:
+                return True, "Extended hours trading allowed"
+
+            return False, "Market is closed — trading blocked"
+
+        except Exception as e:
+            logger.warning("Market hours check failed: %s — allowing trade", e)
+            return True, "Market hours check failed (allowing)"
+
+    # ─── Pyramiding (Livermore) ───
+
+    def can_pyramid(
+        self,
+        symbol: str,
+        current_price: float,
+        avg_entry: float,
+        pyramid_count: Optional[int] = None,
+    ) -> bool:
+        """Check if a pyramid add is allowed for a winning position.
+
+        Conditions:
+        - Pyramiding must be enabled in config.
+        - All standard risk gates (can_trade) must pass.
+        - Unrealised profit must exceed threshold (scaled by level).
+        - Max pyramid levels not exceeded.
+
+        Args:
+            symbol: Ticker symbol.
+            current_price: Current market price.
+            avg_entry: Average entry price of the existing position.
+            pyramid_count: Override for current pyramid level (uses tracked count if None).
+
+        Returns:
+            True if pyramiding is allowed.
+        """
+        if not self.config.enable_pyramiding:
+            return False
+
+        # Check ALL standard risk gates before allowing pyramid add
+        if not self.can_trade():
+            logger.debug("%s: pyramid blocked — risk gates not clear", symbol)
+            return False
+
+        count = pyramid_count if pyramid_count is not None else self._pyramid_counts.get(symbol, 0)
+        if count >= self.config.max_pyramid_levels:
+            logger.debug("%s: max pyramid levels reached (%d)", symbol, count)
+            return False
+
+        if avg_entry <= 0:
+            return False
+
+        unrealised_pct = (current_price - avg_entry) / avg_entry * 100
+        threshold = self.config.pyramid_threshold_pct * (1 + count)
+        if unrealised_pct < threshold:
+            logger.debug(
+                "%s: unrealised profit %.2f%% < threshold %.2f%% for level %d",
+                symbol, unrealised_pct, threshold, count + 1,
+            )
+            return False
+
+        return True
+
+    def calculate_pyramid_size(self, base_size: int, pyramid_level: int) -> int:
+        """Calculate position size for a pyramid add (scales down each level).
+
+        Level 0 = base_size, Level 1 = base * scale_factor,
+        Level 2 = base * scale_factor^2, etc.
+
+        Args:
+            base_size: Original position size in shares.
+            pyramid_level: Current pyramid level (0-based).
+
+        Returns:
+            Number of shares for this pyramid add.
+        """
+        factor = self.config.pyramid_scale_factor ** pyramid_level
+        return max(1, int(base_size * factor))
+
+    def record_pyramid(self, symbol: str) -> int:
+        """Record a pyramid add for a symbol, returns new pyramid count."""
+        self._pyramid_counts[symbol] = self._pyramid_counts.get(symbol, 0) + 1
+        logger.info(
+            "%s: pyramid level %d recorded",
+            symbol, self._pyramid_counts[symbol],
+        )
+        return self._pyramid_counts[symbol]
+
+    def reset_pyramid(self, symbol: str) -> None:
+        """Reset pyramid count when a position is fully closed."""
+        self._pyramid_counts.pop(symbol, None)
+
+    def get_pyramid_count(self, symbol: str) -> int:
+        """Return current pyramid level for a symbol."""
+        return self._pyramid_counts.get(symbol, 0)
+
+    # ─── Monthly Risk Cap (Elder 6% Rule) ───
+
+    def _next_monthly_reset(self) -> date:
+        """Calculate the next monthly reset date.
+
+        Clamps the reset day to the last day of the month to avoid
+        ValueError when monthly_reset_day > days in month (e.g., 31 in Feb).
+        """
+        import calendar
+        today = date.today()
+        reset_day = self.config.monthly_reset_day
+        if today.day >= reset_day:
+            # Next month
+            month = today.month + 1
+            year = today.year
+            if month > 12:
+                month = 1
+                year += 1
+            max_day = calendar.monthrange(year, month)[1]
+            return date(year, month, min(reset_day, max_day))
+        max_day = calendar.monthrange(today.year, today.month)[1]
+        return date(today.year, today.month, min(reset_day, max_day))
+
+    def _reset_monthly_if_needed(self) -> None:
+        """Reset monthly P&L counter if the reset date has passed."""
+        today = date.today()
+        if today >= self._monthly_reset_date:
+            logger.info(
+                "Monthly reset — previous month P&L: $%.2f",
+                self._monthly_pnl,
+            )
+            self._monthly_pnl = 0.0
+            self._monthly_reset_date = self._next_monthly_reset()
+
+    def get_monthly_pnl(self) -> float:
+        """Return current month's accumulated P&L."""
+        self._reset_monthly_if_needed()
+        return self._monthly_pnl
 
     def __repr__(self) -> str:
         status = self.get_status()

@@ -69,6 +69,14 @@ class TrendFollowingConfig:
     htf_period: str = "1D"
     use_candle_confirm: bool = False
 
+    # Pyramiding (Livermore — adding to winners)
+    enable_pyramiding: bool = False
+    pyramid_threshold_pct: float = 2.0
+    max_pyramid_adds: int = 3
+
+    # Data enrichment (news, fundamentals, earnings, regime)
+    use_enricher: bool = True
+
 
 @register_strategy("trend_following")
 class TrendFollowingStrategy:
@@ -81,7 +89,16 @@ class TrendFollowingStrategy:
     def __init__(self, config: TrendFollowingConfig | None = None) -> None:
         self.config = config or TrendFollowingConfig()
         self._trailing_stops: Dict[str, float] = {}
+        self._entry_prices: Dict[str, float] = {}
+        self._pyramid_counts: Dict[str, int] = {}
         self._mtf = MultiTimeframeTrend(htf_period=self.config.htf_period)
+        self._enricher = None
+        if self.config.use_enricher:
+            try:
+                from shared.strategy_enricher import StrategyEnricher
+                self._enricher = StrategyEnricher()
+            except Exception:
+                pass
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "TrendFollowingStrategy":
@@ -174,7 +191,16 @@ class TrendFollowingStrategy:
                 mtf_sell_ok = self._mtf.is_aligned(df, "SELL")
 
             # Entry / continuation logic
-            if fast_val > slow_val and current_close > trend_val and adx_ok and mtf_buy_ok:
+            # Enricher gate: check sentiment, fundamentals, earnings before new entry
+            enricher_ok = True
+            if getattr(self, "_enricher", None) and current_pos == 0:
+                enriched = self._enricher.enrich(sym, df)
+                blocked, reason = self._enricher.should_block_entry(enriched)
+                if blocked:
+                    enricher_ok = False
+                    logger.debug("%s: entry blocked by enricher: %s", sym, reason)
+
+            if fast_val > slow_val and current_close > trend_val and adx_ok and mtf_buy_ok and enricher_ok:
                 if current_pos <= 0 and not volume_ok:
                     # New entry blocked by low volume
                     signals[sym] = 1 if current_pos > 0 else (-1 if current_pos < 0 else 0)
@@ -185,7 +211,9 @@ class TrendFollowingStrategy:
                     signals[sym] = 1
                     if current_pos <= 0:
                         self._trailing_stops[sym] = current_close - cfg.stop_loss_atr_mult * current_atr
-            elif fast_val < slow_val and current_close < trend_val and adx_ok and mtf_sell_ok:
+                        self._entry_prices[sym] = current_close
+                        self._pyramid_counts[sym] = 0
+            elif fast_val < slow_val and current_close < trend_val and adx_ok and mtf_sell_ok and enricher_ok:
                 if current_pos >= 0 and not volume_ok:
                     # New entry blocked by low volume
                     signals[sym] = 1 if current_pos > 0 else (-1 if current_pos < 0 else 0)
@@ -196,13 +224,46 @@ class TrendFollowingStrategy:
                     signals[sym] = -1
                     if current_pos >= 0:
                         self._trailing_stops[sym] = current_close + cfg.stop_loss_atr_mult * current_atr
+                        self._entry_prices[sym] = current_close
+                        self._pyramid_counts[sym] = 0
             elif fast_val < slow_val and current_pos > 0:
                 signals[sym] = 0
                 self._trailing_stops.pop(sym, None)
+                self._entry_prices.pop(sym, None)
+                self._pyramid_counts.pop(sym, None)
             elif fast_val > slow_val and current_pos < 0:
                 signals[sym] = 0
                 self._trailing_stops.pop(sym, None)
+                self._entry_prices.pop(sym, None)
+                self._pyramid_counts.pop(sym, None)
             else:
+                # Pyramiding: add to winning positions
+                if (
+                    cfg.enable_pyramiding
+                    and current_pos > 0
+                    and sym in self._entry_prices
+                ):
+                    entry_price = self._entry_prices[sym]
+                    pyramid_count = self._pyramid_counts.get(sym, 0)
+                    unrealised_pct = (
+                        (current_close - entry_price) / entry_price * 100
+                        if entry_price > 0 else 0
+                    )
+                    threshold = cfg.pyramid_threshold_pct * (1 + pyramid_count)
+                    if (
+                        unrealised_pct >= threshold
+                        and pyramid_count < cfg.max_pyramid_adds
+                    ):
+                        signals[sym] = 2  # signal to add to position
+                        self._pyramid_counts[sym] = pyramid_count + 1
+                        # Tighten trailing stop after each add
+                        tighter_mult = cfg.stop_loss_atr_mult * (0.8 ** (pyramid_count + 1))
+                        self._trailing_stops[sym] = current_close - tighter_mult * current_atr
+                        logger.info(
+                            "%s: PYRAMID ADD level %d (unrealised=%.1f%%, threshold=%.1f%%)",
+                            sym, pyramid_count + 1, unrealised_pct, threshold,
+                        )
+                        continue
                 signals[sym] = 1 if current_pos > 0 else (-1 if current_pos < 0 else 0)
 
         return signals

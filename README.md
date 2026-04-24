@@ -1,6 +1,97 @@
 # Stocks Trading — Scripts & Plugins
 
-A comprehensive repository of trading scripts, automated strategies, technical indicators, scanners, and data analytics tools across major trading platforms. This project provides a unified codebase for developing, testing, and deploying trading automation using each platform's native scripting language and API integrations.
+[![CI](https://github.com/srpatcha/stocks_plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/srpatcha/stocks_plugin/actions/workflows/ci.yml)
+
+A comprehensive algorithmic trading system with **15 strategies**, **7 data sources**, **7-layer risk management**, and full production safety controls. 288+ tests, thread-safe, crash-recoverable.
+
+## Quick Start
+
+```bash
+# Setup (installs deps, validates system, tests connectivity)
+python setup_trading.py
+
+# Paper trade with real Yahoo Finance data (no broker needed)
+python paper_trader.py --symbols AAPL,MSFT,GOOGL --strategy meta_ensemble
+
+# Scan 15 stocks with all strategies
+python paper_trader.py --scan-universe
+
+# Run tests
+python -m pytest tests/test_production_safety.py tests/test_new_features.py -v
+```
+
+## 15 Trading Strategies
+
+| # | Strategy | Data Sources | Based On |
+|---|----------|-------------|----------|
+| 1 | `trend_following` | 📈📊💰📰📅🧠🌊 | EMA crossover + ADX + trailing stop |
+| 2 | `breakout` | 📈📊💰📰📅🧠🌊 | Donchian channel breakout |
+| 3 | `mean_reversion` | 📈📊💰📰📅🧠🌊 | RSI + Bollinger Bands |
+| 4 | `factor` | 📈📊💰📰📅🧠🌊 | 12-1 month momentum long/short |
+| 5 | `darvas_box` | 📈📊💰📰📅🧠🌊 | Darvas box breakout |
+| 6 | `triple_screen` | 📈📊💰📰📅🧠🌊 | Elder triple screen system |
+| 7 | `canslim` | 📈📊💰📰📅🧠🌊 | O'Neil CAN SLIM 7-criteria |
+| 8 | `value` | 📈📊💰📰📅🧠🌊 | Graham fundamental value |
+| 9 | `ml` | 📈📊💰📰📅🧠🌊 | LSTM deep learning |
+| 10 | `rl` | 📈📊💰📰📅🧠🌊 | PPO reinforcement learning |
+| 11 | `self_learning` | 📈📊💰📰📅🧠🌊 | Adaptive ML ensemble |
+| 12 | `sentiment` | 📈📊💰📰📅🧠🌊 | News sentiment + technicals |
+| 13 | `earnings` | 📈📊💰📰📅🧠🌊 | Earnings calendar trading |
+| 14 | `sector_rotation` | 📈📊💰📰📅🧠🌊 | Sector ETF momentum |
+| 15 | `meta_ensemble` | 📈📊💰📰📅🧠🌊 | All sources combined |
+
+📈Price 📊Volume 💰Fundamentals 📰News 📅Earnings 🧠ML 🌊Regime — **all 15 strategies use all 7 data sources**
+
+## 7-Layer Risk Management
+
+```
+Layer 7 ─ PORTFOLIO HEAT ── Max 20% equity at risk
+Layer 6 ─ POSITION CAP ──── Max 25% equity / 10K shares per position
+Layer 5 ─ CIRCUIT BREAKER ─ 10% drawdown → 24h pause
+Layer 4 ─ MONTHLY CAP ───── Elder 6% monthly loss limit
+Layer 3 ─ DAILY LIMIT ───── $5,000/day hard stop
+Layer 2 ─ COOLDOWN ──────── 30-min pause after 3 consecutive losses
+Layer 1 ─ PER-TRADE RISK ── 2% of equity per trade
+```
+
+**Production safety**: fat-finger protection (10K shares), price deviation (±10%), short limits (5 positions / 30%), liquidity filter (50K min volume), market hours enforcement, thread-safe state persistence (SQLite WAL).
+
+## Architecture
+
+```
+stocks_plugin/
+├── shared/
+│   ├── risk_manager.py           ← 7-layer risk engine (thread-safe)
+│   ├── strategy_enricher.py      ← Multi-source data enrichment for all strategies
+│   ├── trade_journal.py          ← Human psychology/discipline journal
+│   ├── data/public_data_fetcher.py ← OHLCV, fundamentals, news, earnings
+│   ├── indicators/               ← 35+ indicators, 14 candlestick patterns
+│   ├── backtesting/              ← Multi-asset backtester with R-multiples/SQN
+│   └── ml/                       ← Sentiment, regime, ensemble, LSTM, RL
+├── strategies/examples/          ← 15 registered strategies
+├── tests/                        ← 288+ tests (production safety + features)
+├── setup_trading.py              ← One-command setup
+├── paper_trader.py               ← Paper trading simulator (no broker needed)
+└── .github/workflows/ci.yml      ← CI/CD with security scan + release automation
+```
+
+## CI/CD
+
+- **Tests**: Python 3.10/3.11/3.12 matrix, production safety + feature + strategy tests
+- **Security**: Bandit scan, hardcoded secrets check, eval/exec scan
+- **Lint**: Syntax validation on all files, flake8 error detection
+- **Strategy validation**: Verifies all 15 strategies register correctly
+- **Release**: Tag `v*` → automated GitHub release with changelog
+
+## Release
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+# → CI runs all checks → creates GitHub Release automatically
+```
+
+See [PRODUCTION_README.md](PRODUCTION_README.md) for full production documentation.
 
 ---
 

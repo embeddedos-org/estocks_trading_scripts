@@ -52,6 +52,8 @@ class TradeRecord:
     hold_bars: int
     mae: float = 0.0  # Max Adverse Excursion (worst unrealized loss)
     mfe: float = 0.0  # Max Favorable Excursion (best unrealized gain)
+    initial_risk: float = 0.0  # Dollar risk at entry (for R-multiple calc)
+    r_multiple: float = 0.0  # P&L expressed as multiple of initial risk (Van Tharp)
 
 
 @dataclass
@@ -90,6 +92,10 @@ class BacktestResultV2:
     short_trades: int = 0
     avg_win: float = 0.0
     avg_loss: float = 0.0
+
+    # Van Tharp metrics
+    avg_r_multiple: float = 0.0  # Average R-multiple across all trades
+    sqn: float = 0.0  # System Quality Number = sqrt(N) * mean(R) / std(R)
 
 
 @dataclass
@@ -482,6 +488,16 @@ class BacktestEngineV2:
         long_trades = sum(1 for t in trades if t.direction == "LONG")
         short_trades = sum(1 for t in trades if t.direction == "SHORT")
 
+        # Van Tharp R-Multiples and SQN
+        r_multiples = [t.r_multiple for t in trades if t.initial_risk > 0]
+        avg_r_multiple = float(np.mean(r_multiples)) if r_multiples else 0.0
+        sqn = 0.0
+        if len(r_multiples) >= 10:
+            r_mean = float(np.mean(r_multiples))
+            r_std = float(np.std(r_multiples, ddof=1))
+            if r_std > 0:
+                sqn = math.sqrt(len(r_multiples)) * r_mean / r_std
+
         # Benchmark metrics
         alpha, beta, ir, te = 0.0, 0.0, 0.0, 0.0
         if self._benchmark_data is not None and len(self._benchmark_data) > 1:
@@ -523,4 +539,6 @@ class BacktestEngineV2:
             short_trades=short_trades,
             avg_win=round(avg_win, 2),
             avg_loss=round(avg_loss, 2),
+            avg_r_multiple=round(avg_r_multiple, 4),
+            sqn=round(sqn, 4),
         )

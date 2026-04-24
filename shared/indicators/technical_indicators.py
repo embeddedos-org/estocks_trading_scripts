@@ -770,6 +770,162 @@ class TechnicalIndicators:
         }, index=df.index)
         return result
 
+    # ================================================================
+    # ELDER INDICATORS
+    # ================================================================
+
+    @staticmethod
+    def force_index(df: pd.DataFrame, period: int = 13) -> pd.Series:
+        """Elder's Force Index: close change * volume, smoothed by EMA.
+
+        Positive values indicate bulls are dominant; negative means bears.
+
+        Args:
+            df: OHLCV DataFrame with 'close' and 'volume' columns.
+            period: EMA smoothing period (default 13).
+
+        Returns:
+            pd.Series of smoothed Force Index values.
+
+        Raises:
+            ValueError: If required columns are missing.
+        """
+        for col in ("close", "volume"):
+            if col not in df.columns:
+                raise ValueError(f"force_index() requires '{col}' column in DataFrame")
+        if len(df) < 2:
+            return pd.Series(np.nan, index=df.index, name="FORCE_INDEX")
+        close_change = df["close"].diff()
+        raw_fi = close_change * df["volume"]
+        return raw_fi.ewm(span=period, adjust=False).mean().rename("FORCE_INDEX")
+
+    @staticmethod
+    def elder_ray(df: pd.DataFrame, period: int = 13) -> pd.DataFrame:
+        """Elder-ray indicator: Bull Power and Bear Power.
+
+        Bull Power = High - EMA(close, period)
+        Bear Power = Low  - EMA(close, period)
+
+        Args:
+            df: OHLCV DataFrame with 'high', 'low', 'close' columns.
+            period: EMA period (default 13).
+
+        Returns:
+            pd.DataFrame with columns 'bull_power' and 'bear_power'.
+
+        Raises:
+            ValueError: If required columns are missing.
+        """
+        for col in ("high", "low", "close"):
+            if col not in df.columns:
+                raise ValueError(f"elder_ray() requires '{col}' column in DataFrame")
+        if len(df) < 2:
+            result = pd.DataFrame(index=df.index)
+            result["bull_power"] = np.nan
+            result["bear_power"] = np.nan
+            return result
+        ema_val = TechnicalIndicators.ema(df["close"], period)
+        bull_power = df["high"] - ema_val
+        bear_power = df["low"] - ema_val
+        result = pd.DataFrame(index=df.index)
+        result["bull_power"] = bull_power
+        result["bear_power"] = bear_power
+        return result
+
+    @staticmethod
+    def elder_impulse(
+        df: pd.DataFrame,
+        ema_period: int = 13,
+        macd_fast: int = 12,
+        macd_slow: int = 26,
+        macd_signal: int = 9,
+    ) -> pd.Series:
+        """Elder Impulse System color coding.
+
+        Green: both EMA and MACD histogram are rising (buy).
+        Red:   both EMA and MACD histogram are falling (sell).
+        Blue:  mixed signals (neutral).
+
+        Args:
+            df: OHLCV DataFrame with 'close' column.
+            ema_period: EMA period for trend direction.
+            macd_fast: MACD fast EMA period.
+            macd_slow: MACD slow EMA period.
+            macd_signal: MACD signal line period.
+
+        Returns:
+            pd.Series of strings: 'green', 'red', or 'blue'.
+
+        Raises:
+            ValueError: If 'close' column is missing.
+        """
+        if "close" not in df.columns:
+            raise ValueError("elder_impulse() requires 'close' column in DataFrame")
+        if len(df) < macd_slow + macd_signal:
+            return pd.Series("blue", index=df.index, name="IMPULSE")
+
+        ema_val = TechnicalIndicators.ema(df["close"], ema_period)
+        _, _, histogram = TechnicalIndicators.macd(
+            df["close"], fast=macd_fast, slow=macd_slow, signal=macd_signal
+        )
+
+        ema_diff = ema_val.diff()
+        hist_diff = histogram.diff()
+
+        # NaN-safe: treat NaN diffs as indeterminate → "blue"
+        ema_rising = ema_diff > 0
+        hist_rising = hist_diff > 0
+        has_data = ema_diff.notna() & hist_diff.notna()
+
+        colors = pd.Series("blue", index=df.index, name="IMPULSE")
+        colors[has_data & ema_rising & hist_rising] = "green"
+        colors[has_data & (~ema_rising) & (~hist_rising)] = "red"
+        return colors
+
+    @staticmethod
+    def fibonacci_retracement(
+        df: pd.DataFrame, lookback: int = 50,
+    ) -> pd.DataFrame:
+        """Fibonacci Retracement levels based on recent swing high/low.
+
+        Computes retracement levels at 23.6%, 38.2%, 50%, 61.8%, 78.6%
+        between the swing high and swing low over the lookback period.
+
+        Args:
+            df: OHLCV DataFrame with 'high' and 'low' columns.
+            lookback: Number of bars to find swing high/low (default 50).
+
+        Returns:
+            pd.DataFrame with columns: swing_high, swing_low, fib_236,
+            fib_382, fib_500, fib_618, fib_786.
+        """
+        n = len(df)
+        result = pd.DataFrame(index=df.index)
+        cols = ["swing_high", "swing_low", "fib_236", "fib_382", "fib_500", "fib_618", "fib_786"]
+        for c in cols:
+            result[c] = np.nan
+
+        if n < lookback:
+            return result
+
+        high = df["high"]
+        low = df["low"]
+
+        for i in range(lookback, n):
+            window_high = float(high.iloc[i - lookback:i + 1].max())
+            window_low = float(low.iloc[i - lookback:i + 1].min())
+            diff = window_high - window_low
+
+            result.iloc[i, 0] = window_high
+            result.iloc[i, 1] = window_low
+            result.iloc[i, 2] = window_high - 0.236 * diff
+            result.iloc[i, 3] = window_high - 0.382 * diff
+            result.iloc[i, 4] = window_high - 0.500 * diff
+            result.iloc[i, 5] = window_high - 0.618 * diff
+            result.iloc[i, 6] = window_high - 0.786 * diff
+
+        return result
+
     @staticmethod
     def pivot_points(df: pd.DataFrame, method: str = "standard") -> pd.DataFrame:
         """Pivot Points (standard, fibonacci, camarilla).

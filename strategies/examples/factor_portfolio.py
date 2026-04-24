@@ -47,6 +47,7 @@ class FactorPortfolioConfig:
     momentum_skip: int = 21  # skip most recent month (12-1 month momentum)
     stop_loss_pct: float = 0.05  # 5% stop loss
     atr_stop_multiplier: float = 2.0  # ATR-based stop price multiplier
+    use_enricher: bool = True
 
 
 @register_strategy("factor")
@@ -62,6 +63,13 @@ class FactorPortfolioStrategy:
         self._tickers: List[str] = []
         self._entry_prices: Dict[str, float] = {}
         self._stop_prices: Dict[str, float] = {}
+        self._enricher = None
+        if self.config.use_enricher:
+            try:
+                from shared.strategy_enricher import StrategyEnricher
+                self._enricher = StrategyEnricher()
+            except Exception:
+                pass
 
     @classmethod
     def from_params(cls, params: Dict[str, Any]) -> "FactorPortfolioStrategy":
@@ -152,18 +160,39 @@ class FactorPortfolioStrategy:
             prev_pos = ctx.positions.get(t, 0)
 
             if t in long_tickers:
-                signals[t] = 1
-                if prev_pos <= 0:
-                    self._entry_prices[t] = current_price
-                    # Compute ATR-based stop price
-                    atr_value = self._compute_atr(ctx.bars[t])
-                    self._stop_prices[t] = current_price - cfg.atr_stop_multiplier * atr_value
+                # Enricher gate
+                enricher_ok = True
+                if getattr(self, "_enricher", None) and prev_pos <= 0 and t in ctx.bars:
+                    enriched = self._enricher.enrich(t, ctx.bars[t])
+                    blocked, _ = self._enricher.should_block_entry(enriched)
+                    if blocked:
+                        enricher_ok = False
+                if enricher_ok:
+                    signals[t] = 1
+                    if prev_pos <= 0:
+                        self._entry_prices[t] = current_price
+                        atr_value = self._compute_atr(ctx.bars[t])
+                        self._stop_prices[t] = current_price - cfg.atr_stop_multiplier * atr_value
+                else:
+                    signals[t] = 0
             elif t in short_tickers:
-                signals[t] = -1
-                if prev_pos >= 0:
-                    self._entry_prices[t] = current_price
-                    atr_value = self._compute_atr(ctx.bars[t])
-                    self._stop_prices[t] = current_price + cfg.atr_stop_multiplier * atr_value
+                enricher_ok = True
+                if getattr(self, "_enricher", None) and prev_pos >= 0 and t in ctx.bars:
+                    enriched = self._enricher.enrich(t, ctx.bars[t])
+                    blocked, _ = self._enricher.should_block_entry(enriched)
+                    if blocked:
+                        enricher_ok = False
+                    # Also block shorts when sentiment is strongly bullish
+                    if enriched.sentiment_available and enriched.sentiment_score > 0.4:
+                        enricher_ok = False
+                if enricher_ok:
+                    signals[t] = -1
+                    if prev_pos >= 0:
+                        self._entry_prices[t] = current_price
+                        atr_value = self._compute_atr(ctx.bars[t])
+                        self._stop_prices[t] = current_price + cfg.atr_stop_multiplier * atr_value
+                else:
+                    signals[t] = 0
             else:
                 signals[t] = 0
                 self._entry_prices.pop(t, None)

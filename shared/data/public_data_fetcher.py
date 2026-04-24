@@ -59,7 +59,12 @@ class PublicDataFetcher:
 
         # FIX 10: Data fetcher circuit breaker
         self._consecutive_failures: int = 0
+        self._fundamentals_failures: int = 0
         self._max_failures: int = 5
+
+        # Fundamentals cache (separate from OHLCV)
+        self._fundamentals_cache: Dict[str, Dict[str, Any]] = {}
+        self._fundamentals_ttl: int = 3600  # 1 hour for fundamentals (changes rarely)
 
         # Fix 18: cache persistence path
         if cache_persist_path is None:
@@ -324,6 +329,152 @@ class PublicDataFetcher:
         except Exception as e:
             logger.debug("Failed to load cache metadata: %s", e)
 
+    # ─── Fundamental Data ─────────────────────────────────────────────────────
+
+    def fetch_fundamentals(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch fundamental data from Yahoo Finance.
+
+        Returns dict with: pe_ratio, forward_pe, peg_ratio, price_to_book,
+        dividend_yield, market_cap, revenue, earnings_growth, profit_margin,
+        debt_to_equity, current_ratio, book_value, sector, industry.
+
+        Uses a separate failure counter from OHLCV to prevent fundamental
+        failures from blocking price data fetching.
+
+        Args:
+            symbol: Ticker symbol (e.g., "AAPL").
+
+        Returns:
+            Dict of fundamental data, or None on failure.
+        """
+        cache_key = f"fundamentals:{symbol}"
+        if self._cache_enabled:
+            cached = self._fundamentals_cache.get(cache_key)
+            if cached and time.time() - cached["ts"] < self._fundamentals_ttl:
+                logger.debug("Fundamentals cache hit: %s", symbol)
+                return cached["data"]
+
+        try:
+            import yfinance as yf
+
+            if self._fundamentals_failures >= self._max_failures:
+                logger.critical(
+                    "Fundamentals circuit breaker OPEN: %s", symbol
+                )
+                cached_fallback = self._fundamentals_cache.get(cache_key)
+                if cached_fallback:
+                    return cached_fallback["data"]
+                return None
+
+            self._rate_limit_fetch()
+
+            ticker = yf.Ticker(symbol)
+            info = ticker.info or {}
+
+            fundamentals: Dict[str, Any] = {
+                "pe_ratio": info.get("trailingPE"),
+                "forward_pe": info.get("forwardPE"),
+                "peg_ratio": info.get("pegRatio"),
+                "price_to_book": info.get("priceToBook"),
+                "dividend_yield": info.get("dividendYield"),
+                "market_cap": info.get("marketCap"),
+                "revenue": info.get("totalRevenue"),
+                "earnings_growth": info.get("earningsGrowth"),
+                "profit_margin": info.get("profitMargins"),
+                "debt_to_equity": info.get("debtToEquity"),
+                "current_ratio": info.get("currentRatio"),
+                "book_value": info.get("bookValue"),
+                "sector": info.get("sector"),
+                "industry": info.get("industry"),
+            }
+
+            # Try to get institutional ownership percentage
+            try:
+                inst_holders = ticker.institutional_holders
+                if inst_holders is not None and not inst_holders.empty:
+                    fundamentals["institutional_pct"] = float(
+                        inst_holders["pctHeld"].sum() * 100
+                    ) if "pctHeld" in inst_holders.columns else None
+                else:
+                    fundamentals["institutional_pct"] = None
+            except Exception:
+                fundamentals["institutional_pct"] = None
+
+            if self._cache_enabled:
+                self._fundamentals_cache[cache_key] = {"data": fundamentals, "ts": time.time()}
+
+            self._fundamentals_failures = 0
+            logger.debug("Fetched fundamentals for %s", symbol)
+            return fundamentals
+
+        except Exception as e:
+            logger.error("Failed to fetch fundamentals for %s: %s", symbol, e)
+            self._fundamentals_failures += 1
+            cached_fallback = self._fundamentals_cache.get(cache_key)
+            if cached_fallback:
+                logger.warning("Returning stale cached fundamentals for %s", symbol)
+                return cached_fallback["data"]
+            return None
+
+    def fetch_earnings_dates(self, symbol: str) -> List[Dict[str, Any]]:
+        """Fetch earnings dates and surprise data from Yahoo Finance.
+
+        Args:
+            symbol: Ticker symbol (e.g., "AAPL").
+
+        Returns:
+            List of dicts with keys: date, eps_estimate, eps_actual, surprise_pct.
+            Returns empty list on failure.
+        """
+        cache_key = f"earnings:{symbol}"
+        if self._cache_enabled:
+            cached = self._fundamentals_cache.get(cache_key)
+            if cached and time.time() - cached["ts"] < self._cache_ttl:
+                logger.debug("Earnings cache hit: %s", symbol)
+                return cached["data"]
+
+        try:
+            import yfinance as yf
+
+            if self._fundamentals_failures >= self._max_failures:
+                logger.critical(
+                    "Fundamentals circuit breaker OPEN for earnings: %s", symbol
+                )
+                cached_fallback = self._fundamentals_cache.get(cache_key)
+                if cached_fallback:
+                    return cached_fallback["data"]
+                return []
+
+            self._rate_limit_fetch()
+
+            ticker = yf.Ticker(symbol)
+            earnings_dates = ticker.earnings_dates
+
+            if earnings_dates is None or earnings_dates.empty:
+                return []
+
+            results: List[Dict[str, Any]] = []
+            for idx, row in earnings_dates.iterrows():
+                entry: Dict[str, Any] = {
+                    "date": str(idx),
+                    "eps_estimate": row.get("EPS Estimate"),
+                    "eps_actual": row.get("Reported EPS"),
+                    "surprise_pct": row.get("Surprise(%)"),
+                }
+                results.append(entry)
+
+            if self._cache_enabled:
+                self._fundamentals_cache[cache_key] = {"data": results, "ts": time.time()}
+
+            self._fundamentals_failures = 0
+            logger.debug("Fetched %d earnings dates for %s", len(results), symbol)
+            return results
+
+        except Exception as e:
+            logger.error("Failed to fetch earnings dates for %s: %s", symbol, e)
+            self._fundamentals_failures += 1
+            return []
+
     # ─── News Headlines ───────────────────────────────────────────────────────
 
     def fetch_news_headlines(
@@ -480,7 +631,30 @@ class PublicDataFetcher:
         """Clear all in-memory caches."""
         self._ohlcv_cache.clear()
         self._news_cache.clear()
+        self._fundamentals_cache.clear()
         logger.debug("Data cache cleared")
+
+    def get_data_health(self) -> dict:
+        """Return data source health status for monitoring.
+
+        Returns dict with:
+        - ohlcv_failures: consecutive OHLCV fetch failures
+        - fundamentals_failures: consecutive fundamentals fetch failures
+        - circuit_breaker_open: whether circuit breaker has tripped
+        - cache_entries: number of cached items
+        - last_fetch_age_s: seconds since last successful fetch
+        """
+        now = time.time()
+        return {
+            "ohlcv_failures": self._consecutive_failures,
+            "fundamentals_failures": self._fundamentals_failures,
+            "circuit_breaker_open": self._consecutive_failures >= self._max_failures,
+            "fundamentals_cb_open": self._fundamentals_failures >= self._max_failures,
+            "ohlcv_cache_entries": len(self._ohlcv_cache),
+            "fundamentals_cache_entries": len(self._fundamentals_cache),
+            "last_fetch_age_s": round(now - self._last_fetch_time, 1) if self._last_fetch_time > 0 else -1,
+            "rate_limit_interval_s": self._min_fetch_interval,
+        }
 
     def __repr__(self) -> str:
         return (

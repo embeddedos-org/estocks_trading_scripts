@@ -264,6 +264,85 @@ class CandlestickPatterns:
         )
 
     @staticmethod
+    def cup_and_handle(
+        df: pd.DataFrame, cup_len: int = 30, handle_len: int = 10,
+        max_scan_bars: int = 500,
+    ) -> pd.Series:
+        """Detect Cup and Handle pattern (bullish continuation).
+
+        Detection logic:
+        1. Find swing high (left lip), followed by a decline of 15-35%
+        2. Base forms a rounded bottom over ``cup_len`` bars
+        3. Price recovers to within 5% of the left lip (right lip)
+        4. Handle: small pullback (< 12% from right lip) over ``handle_len`` bars
+        5. Breakout: price closes above right lip on above-average volume
+
+        Args:
+            df: OHLCV DataFrame with 'high', 'low', 'close', 'volume' columns.
+            cup_len: Minimum bars for cup formation (default 30).
+            handle_len: Maximum bars for handle formation (default 10).
+            max_scan_bars: Maximum bars to scan from the end (default 500).
+                Prevents O(n²) performance on large intraday datasets.
+
+        Returns:
+            Series of 0/100 signals (100 = cup-and-handle breakout detected).
+        """
+        n = len(df)
+        signal = pd.Series(0, index=df.index, dtype=int, name="CUP_AND_HANDLE")
+        if n < cup_len + handle_len + 5:
+            return signal
+
+        close = df["close"].values.astype(float)
+        high = df["high"].values.astype(float)
+        volume = df["volume"].values.astype(float) if "volume" in df.columns else np.ones(n)
+
+        avg_volume = pd.Series(volume).rolling(window=20, min_periods=1).mean().values
+
+        lookback = cup_len + handle_len + 5
+        scan_start = max(lookback, n - max_scan_bars)
+        for i in range(scan_start, n):
+            window_start = i - lookback
+            window_close = close[window_start:i + 1]
+            window_high = high[window_start:i + 1]
+
+            left_lip_idx = int(np.argmax(window_high[:cup_len // 2]))
+            left_lip_price = window_high[left_lip_idx]
+
+            if left_lip_price <= 0:
+                continue
+
+            cup_region = window_close[left_lip_idx:left_lip_idx + cup_len]
+            if len(cup_region) < cup_len // 2:
+                continue
+
+            cup_low = float(np.min(cup_region))
+            decline_pct = (left_lip_price - cup_low) / left_lip_price
+
+            if decline_pct < 0.12 or decline_pct > 0.40:
+                continue
+
+            right_lip_region = window_close[-handle_len - 5:-handle_len] if handle_len < len(window_close) - 5 else window_close[-5:]
+            if len(right_lip_region) == 0:
+                continue
+            right_lip_price = float(np.max(right_lip_region))
+
+            recovery_pct = abs(right_lip_price - left_lip_price) / left_lip_price
+            if recovery_pct > 0.08:
+                continue
+
+            handle_region = window_close[-handle_len:]
+            handle_low = float(np.min(handle_region))
+            handle_pullback = (right_lip_price - handle_low) / right_lip_price if right_lip_price > 0 else 1.0
+            if handle_pullback > 0.12:
+                continue
+
+            current_close = close[i]
+            if current_close > right_lip_price and volume[i] > avg_volume[i]:
+                signal.iloc[i] = 100
+
+        return signal
+
+    @staticmethod
     def scan_all(df: pd.DataFrame) -> pd.DataFrame:
         """Run all available candlestick patterns and return detected signals.
 
@@ -277,6 +356,7 @@ class CandlestickPatterns:
         results["DOJI"] = CandlestickPatterns.doji(df)
         results["HAMMER"] = CandlestickPatterns.hammer(df)
         results["ENGULFING"] = CandlestickPatterns.engulfing(df)
+        results["CUP_AND_HANDLE"] = CandlestickPatterns.cup_and_handle(df)
 
         # TA-Lib only patterns
         if _HAS_TALIB:
