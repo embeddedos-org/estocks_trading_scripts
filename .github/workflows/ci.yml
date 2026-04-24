@@ -37,15 +37,34 @@ jobs:
           pip install lightgbm joblib  # ML regime classifier
           pip install pyyaml python-dotenv requests
           pip install fastapi uvicorn httpx pydantic  # webhook server
+          pip install networkx  # graph memory
           # Optional (may fail on some systems):
           pip install vaderSentiment || true
           pip install yfinance feedparser || true
 
-      - name: Run unit tests
+      - name: Run self-learning agent tests
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           python -m pytest tests/test_self_learning.py -v --tb=short
+
+      - name: Run graph memory tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pytest tests/test_graph_memory.py -v --tb=short
+
+      - name: Run agent-dashboard integration tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pytest tests/test_integration_agent_dashboard.py -v --tb=short
+
+      - name: Run webhook load tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          python -m pytest tests/test_load_webhooks.py -v --tb=short
 
       - name: Run broker integration tests
         env:
@@ -88,7 +107,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install pandas numpy pytest lightgbm joblib
+          pip install pandas numpy pytest lightgbm joblib networkx fastapi uvicorn httpx
 
       - name: Run full simulated trading session
         env:
