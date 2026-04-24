@@ -877,16 +877,21 @@ class RiskManager:
 
     def record_pyramid(self, symbol: str) -> int:
         """Record a pyramid add for a symbol, returns new pyramid count."""
-        self._pyramid_counts[symbol] = self._pyramid_counts.get(symbol, 0) + 1
-        logger.info(
-            "%s: pyramid level %d recorded",
-            symbol, self._pyramid_counts[symbol],
-        )
-        return self._pyramid_counts[symbol]
+        with self._state_lock:
+            self._pyramid_counts[symbol] = self._pyramid_counts.get(symbol, 0) + 1
+            logger.info(
+                "%s: pyramid level %d recorded",
+                symbol, self._pyramid_counts[symbol],
+            )
+            count = self._pyramid_counts[symbol]
+        self._save_state()
+        return count
 
     def reset_pyramid(self, symbol: str) -> None:
         """Reset pyramid count when a position is fully closed."""
-        self._pyramid_counts.pop(symbol, None)
+        with self._state_lock:
+            self._pyramid_counts.pop(symbol, None)
+        self._save_state()
 
     def get_pyramid_count(self, symbol: str) -> int:
         """Return current pyramid level for a symbol."""
