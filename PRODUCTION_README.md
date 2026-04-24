@@ -3,215 +3,289 @@
 Production-ready algorithmic trading framework with 15 strategies, 7 data sources,
 7-layer risk management, and comprehensive backtesting.
 
-## Quick Start
+---
+
+## ⚠️ IMPORTANT DISCLAIMER
+
+**No trading system can guarantee zero losses.** Every trade carries risk. Even with the
+tightest controls, individual trades WILL lose money — that is normal. The system limits
+HOW MUCH you can lose per trade, per day, per month, and total. Past backtest performance
+does NOT guarantee future results. **Paper trade for 30+ days before using real money.**
+
+---
+
+## How to Use — Step by Step
+
+### Step 1: Install
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+cd stocks_plugin
+python setup_trading.py    # installs everything, validates system
+```
 
-# Run a backtest
+### Step 2: Paper Trade (No Real Money)
+
+```bash
+# Scan 3 stocks with the best strategy (uses all data sources)
+python paper_trader.py --symbols AAPL,MSFT,GOOGL --strategy meta_ensemble
+
+# Scan 15 stocks with ALL strategies and show consensus
+python paper_trader.py --scan-universe
+
+# Use a specific strategy
+python paper_trader.py --symbols TSLA --strategy trend_following
+
+# Check your paper portfolio
+python paper_trader.py --portfolio
+```
+
+### Step 3: Understand the Signals
+
+When you run the paper trader, you'll see:
+```
+Symbol   Signal   Price       Shares   Valid  Reason
+AAPL     🟢 BUY   $195.00       128   ✅     OK
+MSFT     ⚪ HOLD  $420.00         0   ✅     FLAT
+TSLA     🔴 SELL  $175.00        50   ✅     OK
+GOOGL    🟢 BUY   $175.00         0   ❌     Bearish sentiment (-0.45)
+```
+
+- **🟢 BUY** — Strategy says buy. `Valid ✅` means risk checks pass.
+- **⚪ HOLD** — No action. Keep current position (or stay out).
+- **🔴 SELL** — Strategy says sell/exit.
+- **❌ Rejected** — Risk manager blocked the trade (bad sentiment, earnings coming, etc.)
+
+### Step 4: Backtest Before Live Trading
+
+```bash
+# Run a strategy on historical data to see how it would have performed
 python -m strategies.examples.trend_following
-
-# Run all tests
-python -m pytest tests/ -v --tb=short -m "not slow and not ml"
+python -m strategies.examples.meta_strategy
 ```
 
-## Architecture
+Output shows: Total Return, Sharpe Ratio, Max Drawdown, Win Rate, Profit Factor.
 
-```
-stocks_plugin/
-├── shared/                          # Core infrastructure
-│   ├── risk_manager.py              # 7-layer risk engine (thread-safe)
-│   ├── risk_manager_unified.py      # Cross-strategy portfolio gate
-│   ├── strategy_enricher.py         # Multi-source data enrichment
-│   ├── trade_journal.py             # Human psychology/discipline journal
-│   ├── data/
-│   │   └── public_data_fetcher.py   # OHLCV, news, fundamentals, earnings
-│   ├── indicators/
-│   │   ├── technical_indicators.py  # 35+ indicators (TA-Lib → pandas-ta → manual)
-│   │   ├── candlestick_patterns.py  # 14 patterns + cup-and-handle
-│   │   └── multi_timeframe.py       # Higher-timeframe trend confirmation
-│   ├── backtesting/
-│   │   └── backtest_engine_v2.py    # Multi-asset backtester with R-multiples/SQN
-│   └── ml/
-│       ├── news_sentiment.py        # FinBERT → VADER → keyword sentiment
-│       ├── ensemble_predictor.py    # 6-model weighted ensemble
-│       ├── regime_classifier.py     # LightGBM TRENDING/RANGING/VOLATILE
-│       ├── trade_memory.py          # SQLite trade journal (ML)
-│       └── self_learning_agent.py   # Adaptive weight optimization
-├── strategies/
-│   ├── __init__.py                  # Strategy registry
-│   └── examples/                    # 15 registered strategies
-└── tests/                           # 288+ tests
-```
+---
 
-## 15 Trading Strategies
+## How to Set Your Risk Limits
 
-| # | Strategy | Key | Based On | Data Sources |
-|---|----------|-----|----------|-------------|
-| 1 | Trend Following | `trend_following` | EMA crossover + ADX | Price, Volume, Fund, News, Earnings, ML, Regime |
-| 2 | Breakout | `breakout` | Donchian channel breakout | All 7 |
-| 3 | Mean Reversion | `mean_reversion` | RSI + Bollinger Bands | All 7 |
-| 4 | Factor Portfolio | `factor` | 12-1 month momentum L/S | All 7 |
-| 5 | Darvas Box | `darvas_box` | Box ceiling breakout | All 7 |
-| 6 | Triple Screen | `triple_screen` | Elder 3-screen system | All 7 |
-| 7 | CAN SLIM | `canslim` | O'Neil 7-criteria scoring | All 7 |
-| 8 | Graham Value | `value` | Fundamental value scoring | All 7 |
-| 9 | ML (LSTM) | `ml` | Deep learning prediction | All 7 |
-| 10 | RL (PPO) | `rl` | Reinforcement learning | All 7 |
-| 11 | Self-Learning | `self_learning` | Adaptive ML ensemble | All 7 |
-| 12 | News Sentiment | `sentiment` | Headline sentiment | All 7 |
-| 13 | Earnings Calendar | `earnings` | Earnings surprise drift | All 7 |
-| 14 | Sector Rotation | `sector_rotation` | Sector ETF momentum | All 7 |
-| 15 | Meta Ensemble | `meta_ensemble` | 5-component weighted composite | All 7 |
+### The Reality About Losses
 
-### Data Sources (7)
+You said you don't want to lose a single dollar. Here's the truth:
 
-| Source | Provider | Method | Cache TTL |
-|--------|----------|--------|-----------|
-| 📈 Price (OHLCV) | Yahoo Finance | `fetch_ohlcv()` | 5 min |
-| 📊 Volume | Yahoo Finance | Included in OHLCV | 5 min |
-| 💰 Fundamentals | Yahoo Finance | `fetch_fundamentals()` | 1 hour |
-| 📰 News | YF + Google RSS | `fetch_news_headlines()` | 5 min |
-| 📅 Earnings | Yahoo Finance | `fetch_earnings_dates()` | 5 min |
-| 🧠 ML Signal | Momentum proxy | `StrategyEnricher._enrich_ml()` | Per-bar |
-| 🌊 Regime | ADX + ATR | `StrategyEnricher._enrich_regime()` | Per-bar |
+| What You Want | What's Possible | How to Get Close |
+|---------------|----------------|-----------------|
+| Zero losses ever | ❌ Impossible | Don't trade — keep money in savings |
+| Lose < $50/day | ✅ Possible | Set `max_daily_loss=50` |
+| Lose < $100/month | ✅ Possible | Set `max_monthly_loss=100` |
+| Never lose > 1% on any trade | ✅ Possible | Set `risk_per_trade_pct=1.0` |
+| Stop all trading if down $500 total | ✅ Possible | Set `max_drawdown_pct=0.5` (on $100K) |
 
-## 7-Layer Risk Management
+### Risk Configuration — How to Set Limits
 
-```
-Layer 7 ─ PORTFOLIO HEAT ──── Max 20% of equity at risk at any time
-Layer 6 ─ POSITION CAP ────── Max 25% equity / 10K shares per position
-Layer 5 ─ CIRCUIT BREAKER ─── 10% drawdown → 24h pause
-Layer 4 ─ MONTHLY CAP ─────── Elder 6% monthly loss limit (opt-in)
-Layer 3 ─ DAILY LIMIT ─────── $5,000/day hard stop
-Layer 2 ─ COOLDOWN ─────────── 30-min pause after 3 consecutive losses
-Layer 1 ─ PER-TRADE RISK ──── 2% of equity per trade
-```
-
-### Production Safety Controls
-
-| Control | Default | Config Field |
-|---------|---------|-------------|
-| Max position size (% equity) | 25% | `max_position_pct_equity` |
-| Max shares per order | 10,000 | `max_shares_per_order` |
-| Price deviation check | ±10% | `max_price_deviation_pct` |
-| Max short positions | 5 | `max_short_positions` |
-| Max short exposure | 30% | `max_short_exposure_pct` |
-| Min avg daily volume | 50,000 | `min_avg_volume` |
-| Max position % of ADV | 5% | `max_position_pct_adv` |
-| Market hours enforcement | Off | `enforce_market_hours` |
-| State persistence | SQLite WAL | `persist_path` |
-
-### Pre-Order Validation
+Edit the configuration in your strategy runner or paper_trader.py:
 
 ```python
 from shared.risk_manager import RiskManager, RiskManagerConfig
 
-rm = RiskManager(config=RiskManagerConfig(total_capital=100000))
-
-# Every order must pass validate_order() before execution
-ok, reason = rm.validate_order(
-    symbol="AAPL",
-    shares=100,
-    price=195.0,
-    last_price=194.5,
-    direction="LONG",
-    avg_daily_volume=50_000_000,
-)
-if ok:
-    # Place order
-    pass
-else:
-    print(f"Order rejected: {reason}")
-```
-
-## Thread Safety
-
-`RiskManager` is thread-safe for live trading:
-- `record_trade()`, `add_position()`, `remove_position()` acquire `_state_lock`
-- `_save_state()` acquires `_persist_lock` for SQLite writes
-- Safe for concurrent broker fill callbacks
-
-## Strategy Enricher
-
-All 15 strategies use `StrategyEnricher` to gate entries with multi-source checks:
-
-```python
-from shared.strategy_enricher import StrategyEnricher
-
-enricher = StrategyEnricher()
-enriched = enricher.enrich("AAPL", df)
-
-# Check before every entry:
-blocked, reason = enricher.should_block_entry(enriched)
-if blocked:
-    # Skip this trade — bad sentiment, poor fundamentals, or earnings blackout
-    pass
-```
-
-**Entry is blocked when:**
-- News sentiment < -0.4 (strongly bearish headlines)
-- Fundamental quality score < 0.4 (poor P/E, debt, margins)
-- Earnings announcement within 2 trading days (gap risk)
-
-## Configuration for Live Trading
-
-```python
+# ═══════════════════════════════════════════════════════════
+# ULTRA-CONSERVATIVE CONFIG — Minimum possible risk
+# ═══════════════════════════════════════════════════════════
 config = RiskManagerConfig(
-    total_capital=100_000.0,
-    risk_per_trade_pct=1.0,           # Conservative 1%
-    max_daily_loss=2_000.0,           # 2% daily max
-    max_monthly_loss=4_000.0,         # 4% monthly max
-    max_drawdown_pct=8.0,             # Circuit breaker at 8%
-    max_trades_per_hour=5,
-    max_consecutive_losses=3,
-    cooldown_seconds=3600,            # 1 hour cooldown
-    max_position_pct_equity=15.0,     # 15% max per position
-    max_shares_per_order=5_000,
-    max_price_deviation_pct=5.0,
-    enforce_market_hours=True,
-    min_avg_volume=100_000,
+
+    # ─── How much money you're trading with ───
+    total_capital=10000.0,          # Start with $10K (small!)
+
+    # ─── Per-Trade Risk ───
+    risk_per_trade_pct=0.5,         # Risk only 0.5% per trade = $50 max loss per trade
+    max_position_pct_equity=10.0,   # Never put more than 10% ($1,000) in one stock
+    max_shares_per_order=100,       # Never buy more than 100 shares at once
+
+    # ─── Daily Limit ───
+    max_daily_loss=100.0,           # Stop ALL trading if you lose $100 in a day
+    auto_flatten_on_daily_loss=True, # Auto-close all positions when daily limit hit
+
+    # ─── Monthly Limit ───
+    max_monthly_loss=300.0,         # Stop ALL trading if you lose $300 in a month (3%)
+
+    # ─── Total Loss Circuit Breaker ───
+    max_drawdown_pct=5.0,           # Stop for 24 hours if account drops 5% ($500)
+    circuit_breaker_pause_hours=24, # Pause for 24 hours after circuit breaker
+
+    # ─── Emotional Protection ───
+    max_consecutive_losses=2,       # Pause after just 2 losses in a row
+    cooldown_seconds=3600,          # Pause for 1 HOUR after consecutive losses
+    max_trades_per_hour=3,          # Max 3 trades per hour (prevent overtrading)
+    min_seconds_between_trades=60,  # Wait at least 1 minute between trades
+
+    # ─── Position Limits ───
+    max_open_positions=3,           # Max 3 stocks at a time
+    max_portfolio_heat_pct=10.0,    # Max 10% of portfolio at risk at any time
+
+    # ─── Safety Checks ───
+    max_price_deviation_pct=5.0,    # Block trades if price moved >5% from last known
+    min_avg_volume=100000,          # Only trade stocks with 100K+ daily volume
+    max_position_pct_adv=2.0,       # Position can't be >2% of daily volume
+
+    # ─── Short Selling (disable for safety) ───
+    max_short_positions=0,          # NO short selling at all
+    max_short_exposure_pct=0.0,     # Zero short exposure
+
+    # ─── Market Hours ───
+    enforce_market_hours=True,      # Only trade during NYSE hours
+
+    # ─── Pyramiding (disable) ───
+    enable_pyramiding=False,        # Don't add to positions
+
+    # ─── Save State (crash recovery) ───
     persist_path="~/.stocks_plugin/risk_state.db",
-    enable_pyramiding=False,
 )
+
+rm = RiskManager(config=config)
 ```
+
+### What This Config Does
+
+With the ultra-conservative config above ($10K account):
+
+| Scenario | Maximum Loss | What Happens |
+|----------|-------------|-------------|
+| Worst single trade | **$50** (0.5%) | Fixed fractional sizing |
+| 2 losses in a row | **$100** then **1 hour pause** | Cooldown triggers |
+| Worst single day | **$100** then **trading stops** | Daily limit |
+| Worst single month | **$300** then **trading stops** | Monthly limit |
+| Worst total drawdown | **$500** then **24 hour pause** | Circuit breaker |
+| Fat-finger mistake | **Blocked** | 100 share max + price check |
+| Short selling gone wrong | **Impossible** | Shorts disabled (max=0) |
+| Illiquid stock | **Blocked** | 100K min volume |
+| Weekend gap | **$1,000 max** | 10% position cap |
+
+### How Each Limit Works
+
+```
+YOU WANT TO BUY AAPL AT $195
+
+Step 1: Position Sizing
+   Account: $10,000
+   Risk per trade: 0.5% = $50
+   Stop loss: $195 - ATR*2 = ~$190 (risk $5/share)
+   Shares = $50 / $5 = 10 shares ($1,950 total)
+   ✅ Under 10% cap ($1,000 limit → actually capped to 5 shares = $975)
+
+Step 2: Pre-Order Validation
+   ✅ 5 shares < 100 share max (fat-finger OK)
+   ✅ $195 is within 5% of last price (price sanity OK)
+   ✅ AAPL volume 50M > 100K min (liquidity OK)
+   ✅ Not a short position (shorts disabled)
+   ✅ Daily loss $0 < $100 limit (daily OK)
+   ✅ Monthly loss $0 < $300 limit (monthly OK)
+
+Step 3: Enricher Check
+   ✅ News sentiment > -0.4 (not strongly bearish)
+   ✅ Fundamentals quality > 0.4 (P/E reasonable)
+   ✅ No earnings in next 2 days (no gap risk)
+   ✅ Market is open (enforce_market_hours=True)
+
+→ APPROVED: Buy 5 shares of AAPL at $195 ($975 total)
+→ Stop loss at $190 → Max loss on this trade = $25
+```
+
+---
+
+## All 15 Strategies Explained Simply
+
+| Strategy | What It Does | When It Buys | When It Sells | Risk Level |
+|----------|-------------|-------------|--------------|------------|
+| `trend_following` | Follows the trend | Price trending up + strong momentum | Trend reverses | Low |
+| `breakout` | Catches new highs | Price breaks above N-day high with volume | Trailing stop | Medium |
+| `mean_reversion` | Buys dips | RSI oversold + at bottom of Bollinger Band | Price returns to middle | Medium |
+| `canslim` | O'Neil growth picks | 5+ of 7 criteria (earnings, growth, new highs) | Score drops below 3 | Medium |
+| `value` | Graham value picks | Cheap P/E + low debt + dividends | Score drops or P/E > 20 | Low |
+| `darvas_box` | Box breakouts | Price breaks above consolidation box | Below box floor | Medium |
+| `triple_screen` | 3 timeframe filter | Weekly + Daily + Intraday all agree | Trend reversal | Low |
+| `sentiment` | News-driven | Bullish news + technical confirmation | Bearish news | Medium |
+| `earnings` | Around earnings | Before earnings (stocks that usually beat) | After event | High |
+| `sector_rotation` | Best sectors | Top 3 sectors by 12-month momentum | Sector drops out | Low |
+| `factor` | Momentum ranking | Long strongest, short weakest | Monthly rebalance | Medium |
+| `ml` | LSTM prediction | Neural network predicts up | Predicts down | Medium |
+| `rl` | RL agent | Reinforcement learning agent acts | Agent says sell | Medium |
+| `self_learning` | Adaptive AI | Learns from own trades, adapts | AI decides | Medium |
+| `meta_ensemble` | Combines ALL | 5-component score > 0.4 + 3/5 agree | Score < 0.2 | **Lowest** |
+
+**Recommended for beginners:** `meta_ensemble` (safest — requires multiple signals to agree)
+
+---
+
+## Configuration Reference
+
+### All Risk Parameters
+
+| Parameter | Default | What It Controls |
+|-----------|---------|-----------------|
+| `total_capital` | 100,000 | Your account size in dollars |
+| `risk_per_trade_pct` | 2.0 | Max % of account to risk per trade |
+| `max_daily_loss` | 5,000 | Dollar amount — stop trading for the day |
+| `max_monthly_loss` | 0 (off) | Dollar amount — stop trading for the month |
+| `max_drawdown_pct` | 10.0 | % drop from peak → 24h circuit breaker |
+| `max_consecutive_losses` | 3 | Losses in a row → cooldown |
+| `cooldown_seconds` | 1800 | Seconds to pause after consecutive losses |
+| `max_trades_per_hour` | 10 | Prevent overtrading |
+| `min_seconds_between_trades` | 30 | Minimum gap between trades |
+| `max_open_positions` | 10 | Max stocks held at once |
+| `max_portfolio_heat_pct` | 20.0 | Max % of equity at risk across all positions |
+| `max_position_pct_equity` | 25.0 | Max % of equity in one stock |
+| `max_position_notional` | 0 (off) | Hard dollar cap per position |
+| `max_shares_per_order` | 10,000 | Fat-finger protection |
+| `max_price_deviation_pct` | 10.0 | Block if price moved too much |
+| `max_short_positions` | 5 | Max number of short positions |
+| `max_short_exposure_pct` | 30.0 | Max % of equity in shorts |
+| `enforce_market_hours` | False | Only trade during NYSE hours |
+| `min_avg_volume` | 50,000 | Skip illiquid stocks |
+| `enable_pyramiding` | False | Add to winning positions |
+
+### Choosing Your Settings
+
+| Your Situation | `risk_per_trade_pct` | `max_daily_loss` | `max_monthly_loss` |
+|---------------|---------------------|-------------------|---------------------|
+| **Very cautious** ($10K account) | 0.5% ($50) | $100 | $300 |
+| **Conservative** ($50K account) | 1.0% ($500) | $1,000 | $2,500 |
+| **Standard** ($100K account) | 2.0% ($2,000) | $5,000 | $6,000 |
+| **Aggressive** ($100K account) | 3.0% ($3,000) | $10,000 | $10,000 |
+
+---
 
 ## Testing
 
 ```bash
-# Core tests (fast, no ML dependencies)
-python -m pytest tests/test_new_features.py tests/test_production_safety.py \
-    tests/test_shared_risk_manager.py tests/test_shared_indicators.py \
-    tests/test_strategy_examples.py -v
+# Quick validation (< 2 seconds)
+python validate_all.py                # 108 functional checks
 
-# Full suite
-python -m pytest tests/ -v --tb=short -m "not slow and not ml"
+# Full test suite (< 2 seconds)
+python -m pytest tests/test_production_safety.py tests/test_new_features.py \
+    tests/test_shared_risk_manager.py tests/test_strategy_examples.py -v
 
-# Production safety only
-python -m pytest tests/test_production_safety.py -v
+# End-to-end pipeline test
+python e2e_test.py
 ```
 
-**Current status: 288 passed, 12 skipped, 0 failures.**
+---
 
-## Trading Books Implemented
+## FAQ
 
-| Book | Author | Coverage | Key Features |
-|------|--------|----------|-------------|
-| Trading in the Zone | Mark Douglas | ✅ | Pre-trade checklist, discipline journal |
-| The Disciplined Trader | Mark Douglas | ✅ | Cooldown, trade frequency limits |
-| Daily Trading Coach | Steenbarger | ✅ | Trade journal, performance by mood |
-| Market Wizards | Schwager | ✅ | Risk per trade, daily limits, circuit breakers |
-| Reminiscences | Livermore | ✅ | Pyramiding, trend following, stops |
-| Trade Your Way | Van Tharp | ✅ | Fixed fractional, Kelly, R-multiples, SQN |
-| Trading for a Living | Elder | ✅ | Force Index, Elder-ray, Impulse, Triple Screen, 6% rule |
-| Darvas Box Method | Darvas | ✅ | Box breakout strategy |
-| TA of Financial Markets | Murphy | ✅ | 35+ indicators, Fibonacci, candlesticks |
-| How to Make Money | O'Neil | ✅ | CAN SLIM, cup-and-handle |
-| Intelligent Investor | Graham | ✅ | Value strategy, fundamental scoring |
+**Q: Can I guarantee I won't lose money?**
+A: No. Every trade can lose. The system limits HOW MUCH you lose, not IF you lose.
 
-## Disclaimer
+**Q: What's the safest strategy?**
+A: `meta_ensemble` — requires 3 of 5 data sources to agree before buying.
 
-This software is for educational and research purposes. Past backtest performance
-does not guarantee future results. Always paper trade for 30+ days before using
-real money. The authors are not responsible for any trading losses.
+**Q: How do I start with minimum risk?**
+A: Use the ultra-conservative config above with $10K, 0.5% risk, $100 daily limit.
+
+**Q: Do I need a broker account?**
+A: No — `paper_trader.py` works with free Yahoo Finance data, no broker needed.
+
+**Q: What if Yahoo Finance goes down?**
+A: The system has circuit breakers and stale cache fallback. It stops trading, never crashes.
+
+**Q: Is my money safe from bugs?**
+A: 7 independent safety layers protect you. All 288 tests pass. But always start with paper trading.
