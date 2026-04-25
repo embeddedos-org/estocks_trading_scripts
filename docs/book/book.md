@@ -1,4 +1,15 @@
-# eStocks Trading Scripts — Algorithmic Trading System: Product Reference
+---
+title: "eStocks Trading Scripts — Official Reference Guide"
+author: "Srikanth Patchava & EmbeddedOS Contributors"
+date: "April 2026"
+version: "v1.0.0"
+bibliography: references.bib
+csl: ieee.csl
+titlepage: true
+titlepage-background: "cover.png"
+---
+
+# eStocks Trading Scripts — Algorithmic Trading [@chan2013] System: Product Reference
 
 **By Srikanth Patchava & EmbeddedOS Contributors**
 
@@ -37,8 +48,8 @@ that the original copyright notice is retained.
 - [Chapter 4: 7-Layer Risk Management](#chapter-4-7-layer-risk-management)
 - [Chapter 5: Data Sources and Enrichment](#chapter-5-data-sources-and-enrichment)
 - [Chapter 6: Technical Indicators](#chapter-6-technical-indicators)
-- [Chapter 7: Backtesting Engine](#chapter-7-backtesting-engine)
-- [Chapter 8: Machine Learning](#chapter-8-machine-learning)
+- [Chapter 7: Backtesting [@backtrader] Engine](#chapter-7-backtesting-engine)
+- [Chapter 8: Machine Learning [@dePrado2018]](#chapter-8-machine-learning)
 - [Chapter 9: Paper Trading](#chapter-9-paper-trading)
 - [Chapter 10: TradingView Integration](#chapter-10-tradingview-integration)
 - [Chapter 11: Interactive Brokers Integration](#chapter-11-interactive-brokers-integration)
@@ -131,7 +142,7 @@ The eStocks Trading Scripts system delivers:
   detection feed into every strategy through the Strategy Enricher.
 
 - **7-Layer Risk Management** — Defense-in-depth risk controls from
-  per-trade risk limits to portfolio-wide circuit breakers ensure
+  per-trade risk limits to portfolio [@markowitz1952]-wide circuit breakers ensure
   that no single failure can cause catastrophic loss.
 
 - **288+ Automated Tests** — Comprehensive test coverage including
@@ -2811,7 +2822,7 @@ print(f"Cooldown active: {status['cooldown_active']}")
 | **Trailing Stop** | Stop-loss that moves in the direction of profit |
 | **Triple Screen** | Alexander Elder's multi-timeframe trading system |
 | **TWS** | Trader Workstation -- Interactive Brokers' trading platform |
-| **VaR** | Value at Risk -- statistical measure of potential loss |
+| **VaR** | Value at Risk [@jorion2006] -- statistical measure of potential loss |
 | **VIX** | CBOE Volatility Index -- market fear gauge |
 | **VWAP** | Volume-Weighted Average Price |
 | **WAL** | Write-Ahead Logging -- SQLite journal mode for crash safety |
@@ -2843,3 +2854,8 @@ Trading Scripts product.
 *eStocks Trading Scripts -- Algorithmic Trading System: Product Reference*
 *Copyright 2026 Srikanth Patchava & EmbeddedOS Contributors*
 *Part of the EmbeddedOS Ecosystem*
+
+## References
+
+::: {#refs}
+:::
