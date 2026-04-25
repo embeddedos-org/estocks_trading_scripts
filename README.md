@@ -3,6 +3,7 @@
 [![CI](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/ci.yml/badge.svg)](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/codeql.yml/badge.svg)](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/codeql.yml)
 [![Scorecard](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/scorecard.yml/badge.svg)](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/scorecard.yml)
+[![Book](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/book-build.yml/badge.svg)](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/book-build.yml)
 
 A comprehensive algorithmic trading system with **15 strategies**, **7 data sources**, **7-layer risk management**, and full production safety controls. 288+ tests, thread-safe, crash-recoverable.
 
