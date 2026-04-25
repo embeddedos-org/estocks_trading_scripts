@@ -44,6 +44,9 @@ that the original copyright notice is retained.
 
 ## Table of Contents
 
+
+![Figure: eStocks_Trading_Scripts — 3D Product Visualization](images/product-3d.png)
+
 - [Preface](#preface)
 - [Chapter 1: Introduction](#chapter-1-introduction)
 - [Chapter 2: Architecture Overview](#chapter-2-architecture-overview)
