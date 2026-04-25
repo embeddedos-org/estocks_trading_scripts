@@ -1,6 +1,8 @@
 # Stocks Trading — Scripts & Plugins
 
-[![CI](https://github.com/srpatcha/stocks_plugin/actions/workflows/ci.yml/badge.svg)](https://github.com/srpatcha/stocks_plugin/actions/workflows/ci.yml)
+[![CI](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/ci.yml/badge.svg)](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/codeql.yml/badge.svg)](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/codeql.yml)
+[![Scorecard](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/scorecard.yml/badge.svg)](https://github.com/embeddedos-org/eStocks_Trading_Scripts/actions/workflows/scorecard.yml)
 
 A comprehensive algorithmic trading system with **15 strategies**, **7 data sources**, **7-layer risk management**, and full production safety controls. 288+ tests, thread-safe, crash-recoverable.
 
@@ -592,3 +594,15 @@ python -m strategies.runner backtest --strategy self_learning --data synthetic
 python -m strategies.runner backtest --strategy self_learning --data SPY.csv --params models=regime,lstm
 ```
 </details>
+
+## Security
+
+Please see [SECURITY.md](SECURITY.md) for reporting vulnerabilities.
+
+## Code of Conduct
+
+This project follows the [Contributor Covenant v2.1](CODE_OF_CONDUCT.md).
+
+
+---
+Part of the [EmbeddedOS Organization](https://embeddedos-org.github.io).
