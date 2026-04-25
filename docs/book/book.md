@@ -29,6 +29,9 @@ titlepage-background: "cover.png"
 
 ## Copyright & License
 
+![Figure: eStocks System Architecture — strategy engine, backtesting, and order execution](images/architecture.png)
+
+
 Copyright © 2026 Srikanth Patchava & EmbeddedOS Contributors.
 All rights reserved.
 
