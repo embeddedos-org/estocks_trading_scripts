@@ -1886,6 +1886,9 @@ conn.connect()
 
 The IB integration supports full automated trading:
 
+![Figure: eStocks Trading Execution Loop — market data to order submission with risk checks](images/trading-loop.png)
+
+
 - **Market orders** -- Immediate execution at best price
 - **Limit orders** -- Execute at specified price or better
 - **Stop orders** -- Trigger at specified price level
@@ -2733,6 +2736,9 @@ print(f"Cooldown active: {status['cooldown_active']}")
 ### Problem: Backtesting is slow
 
 **Solution:**
+
+![Figure: eStocks Backtest Pipeline — historical replay, strategy execution, metrics reporting](images/backtest-flow.png)
+
 
 1. Reduce the number of symbols being tested
 2. Use a shorter date range for initial testing
